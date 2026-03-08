@@ -976,6 +976,7 @@ imgui.OnFrame(function() return WinState[0] end,
             if imgui.Checkbox('Включить звук', playSound) then
                 addOneOffSound(0.0, 0.0, 0.0, 1139)
             end
+            imgui.Text('Версия: ' .. tostring(thisScript().version or '1.0'))
             for i = 54, 10, -1 do
                 imgui.ColSeparator('FF0000', i)
             end
