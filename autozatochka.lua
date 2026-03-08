@@ -796,7 +796,7 @@ end
 
 function main()
     while not isSampAvailable() do wait(100) end
-    sampRegisterChatCommand('zatochka', function() WinState[0] = not WinState[0] end)
+    sampRegisterChatCommand('mt', function() WinState[0] = not WinState[0] end)
 
     -- Загрузка звука успешной заточки с GitHub в фоне
     lua_thread.create(function()
@@ -1302,6 +1302,7 @@ function theme()
     imgui.GetStyle().Colors[imgui.Col.PlotHistogramHovered]   = ImVec4(0.48, 0.48, 0.52, 1.00)
     imgui.GetStyle().Colors[imgui.Col.TextSelectedBg]         = ImVec4(0.28, 0.28, 0.32, 0.85)
 end
+
 
 
 
