@@ -1032,13 +1032,13 @@ imgui.OnFrame(function() return WinState[0] end,
             if imgui.Button('Проверить обновления', imgui.ImVec2(140, 24)) then
                 lua_thread.create(function()
                     if autoupdate_loaded and Update then
-                        sampAddChatMessage('[AutoZatochka] Проверка обновлений...', -1)
+                        print('[AutoZatochka] Проверка обновлений...', -1)
                         wait(100)
                         pcall(Update.check, Update.json_url, Update.prefix, Update.url)
                         wait(500)
-                        sampAddChatMessage('[AutoZatochka] Если есть новая версия — скрипт обновится и перезагрузится.', -1)
+                        print('[AutoZatochka] Если есть новая версия — скрипт обновится и перезагрузится.', -1)
                     else
-                        sampAddChatMessage('[AutoZatochka] Автообновление недоступно.', -1)
+                        print('[AutoZatochka] Автообновление недоступно.', -1)
                     end
                 end)
             end
@@ -1302,4 +1302,5 @@ function theme()
     imgui.GetStyle().Colors[imgui.Col.PlotHistogramHovered]   = ImVec4(0.48, 0.48, 0.52, 1.00)
     imgui.GetStyle().Colors[imgui.Col.TextSelectedBg]         = ImVec4(0.28, 0.28, 0.32, 0.85)
 end
+
 
