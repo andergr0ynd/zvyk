@@ -23,6 +23,46 @@ local SOUND_SUBDIR = 'autozatochka'
 local success_sound_stream = nil
 local as_action = require('moonloader').audiostream_state
 
+-- Автообновление скрипта с GitHub
+local UPDATE_SCRIPT_URL = 'https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/autozatochka.lua'
+
+-- Сравнение версий "X.Y" (true если remote > current)
+local function isNewerVersion(current, remote)
+    if not current or not remote then return false end
+    local c1, c2 = current:match('^(%d+)%.(%d+)')
+    local r1, r2 = remote:match('^(%d+)%.(%d+)')
+    if not c1 or not r1 then return false end
+    c1, c2 = tonumber(c1) or 0, tonumber(c2) or 0
+    r1, r2 = tonumber(r1) or 0, tonumber(r2) or 0
+    if r1 > c1 then return true end
+    if r1 == c1 and r2 > c2 then return true end
+    return false
+end
+
+-- Проверка обновления и установка при наличии новой версии
+local function checkUpdate()
+    local scriptPath = thisScript().path
+    local currentVer = thisScript().version or '1.0'
+    local tmp = os.tmpname()
+    if doesFileExist(tmp) then os.remove(tmp) end
+    downloadUrlToFile(UPDATE_SCRIPT_URL, tmp)
+    if not doesFileExist(tmp) then return end
+    local f = io.open(tmp, 'r')
+    if not f then os.remove(tmp) return end
+    local content = f:read('*a')
+    f:close()
+    os.remove(tmp)
+    local remoteVer = content and content:match("script_version%([\'\"]([^\'\"]+)[\'\"]%)")
+    if not remoteVer or not isNewerVersion(currentVer, remoteVer) then return end
+    -- Скачиваем новую версию поверх текущего скрипта и перезагружаем
+    downloadUrlToFile(UPDATE_SCRIPT_URL, scriptPath)
+    if doesFileExist(scriptPath) then
+        sampAddChatMessage(u8:decode('[AutoZatochka] Установлена версия ' .. tostring(remoteVer) .. '. Перезагрузка...'), -1)
+        wait(500)
+        thisScript():reload()
+    end
+end
+
 -- Stone
 local tochi, workshop_check, stone_check = false, false, false
 local lost_stone_onLVL, all_lost = 0, 0
@@ -700,6 +740,12 @@ function main()
         wait(500)
         initSuccessSound()
     end)
+
+    -- Проверка обновления скрипта с GitHub в фоне
+    lua_thread.create(function()
+        wait(2000)
+        pcall(checkUpdate)
+    end)
     
     -- Регистрируем обработчик входящих пакетов для перехвата CEF событий (как в kazik.lua)
     addEventHandler('onReceivePacket', function(id, bs)
@@ -916,6 +962,15 @@ imgui.OnFrame(function() return WinState[0] end,
                     sampAddChatMessage(u8:decode'[AutoZatochka] Перезагрузка скрипта...', -1)
                     wait(1000)
                     thisScript():reload()
+                end)
+            end
+            if imgui.Button('Проверить обновления', imgui.ImVec2(140, 24)) then
+                lua_thread.create(function()
+                    sampAddChatMessage(u8:decode'[AutoZatochka] Проверка обновлений...', -1)
+                    wait(100)
+                    pcall(checkUpdate)
+                    wait(500)
+                    sampAddChatMessage(u8:decode'[AutoZatochka] Проверка завершена. Если есть новая версия — скрипт перезагрузится.', -1)
                 end)
             end
             if imgui.Checkbox('Включить звук', playSound) then
