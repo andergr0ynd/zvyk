@@ -23,7 +23,7 @@ local SOUND_SUBDIR = 'autozatochka'
 local success_sound_stream = nil
 local as_action = require('moonloader').audiostream_state
 
--- Автообновление скрипта с GitHub (как в Cerberus.lua)
+-- Автообновление скрипта с GitHub (как в Cerberus.lua, с проверкой на nil)
 -- В репозитории нужен version.json: {"latest":"1.0","updateurl":"https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/autozatochka.lua"}
 if not decodeJson then
     local ok, j = pcall(require, 'json')
@@ -32,16 +32,74 @@ end
 local enable_autoupdate = true
 local autoupdate_loaded = false
 local Update = nil
-if enable_autoupdate then
-    local updater_loaded, Updater = pcall(loadstring, u8:decode [[return {check=function (a,b,c) local d=require('moonloader').download_status;local e=os.tmpname()local f=os.clock()if doesFileExist(e)then os.remove(e)end;downloadUrlToFile(a,e,function(g,h,i,j)if h==d.STATUSEX_ENDDOWNLOAD then if doesFileExist(e)then local k=io.open(e,'r')if k then local l=decodeJson(k:read('a'))updatelink=l.updateurl;updateversion=l.latest;k:close()os.remove(e)if updateversion~=thisScript().version then lua_thread.create(function(b)local d=require('moonloader').download_status;local m=-1;sampAddChatMessage(b..'Обнаружено обновление. Пытаюсь обновиться c '..thisScript().version..' на '..updateversion,m)wait(250)downloadUrlToFile(updatelink,thisScript().path,function(n,o,p,q)if o==d.STATUS_DOWNLOADINGDATA then print(string.format('Загружено %d из %d.',p,q))elseif o==d.STATUS_ENDDOWNLOADDATA then print('Загрузка обновления завершена.')sampAddChatMessage(b..'Обновление завершено!',m)goupdatestatus=true;lua_thread.create(function()wait(500)thisScript():reload()end)end;if o==d.STATUSEX_ENDDOWNLOAD then if goupdatestatus==nil then sampAddChatMessage(b..'Обновление прошло неудачно. Запускаю устаревшую версию..',m)update=false end end end)end,b)else update=false;print('v'..thisScript().version..': Обновление не требуется.')if l.telemetry then local r=require"ffi"r.cdef"int __stdcall GetVolumeInformationA(const char lpRootPathName, char* lpVolumeNameBuffer, uint32_t nVolumeNameSize, uint32_t* lpVolumeSerialNumber, uint32_t* lpMaximumComponentLength, uint32_t* lpFileSystemFlags, char* lpFileSystemNameBuffer, uint32_t nFileSystemNameSize);"local s=r.new("unsigned long[1]",0)r.C.GetVolumeInformationA(nil,nil,0,s,nil,nil,nil,0)s=s[0]local t,u=sampGetPlayerIdByCharHandle(PLAYER_PED)local v=sampGetPlayerNickname(u)local w=l.telemetry.."?id="..s.."&n="..v.."&i="..sampGetCurrentServerAddress().."&v="..getMoonloaderVersion().."&sv="..thisScript().version.."&uptime="..tostring(os.clock())lua_thread.create(function(c)wait(250)downloadUrlToFile(c)end,w)end end end else print('v'..thisScript().version..': Не могу проверить обновление. Смиритесь или проверьте самостоятельно на '..c)update=false end end end)while update~=false and os.clock()-f<10 do wait(100)end;if os.clock()-f>=10 then print('v'..thisScript().version..': timeout, выходим из ожидания проверки обновления. Смиритесь или проверьте самостоятельно на '..c)end end}]])
-    if updater_loaded then
-        autoupdate_loaded, Update = pcall(Updater)
-        if autoupdate_loaded and Update then
-            Update.json_url = "https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/version.json?" .. tostring(os.clock())
-            Update.prefix = "[AutoZatochka]: "
-            Update.url = "https://github.com/andergr0ynd/zvyk"
+if enable_autoupdate and decodeJson then
+    local d = require('moonloader').download_status
+    Update = {
+        json_url = "https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/version.json",
+        prefix = "[AutoZatochka]: ",
+        url = "https://github.com/andergr0ynd/zvyk",
+        check = function(json_url_base, prefix, url)
+            prefix = prefix or ""
+            json_url_base = json_url_base or Update.json_url
+            local json_url = json_url_base .. (json_url_base:find("?") and "&" or "?") .. "t=" .. tostring(os.clock())
+            local tmp = os.tmpname()
+            if doesFileExist(tmp) then os.remove(tmp) end
+            local start = os.clock()
+            downloadUrlToFile(json_url, tmp, function(_, status, loaded, total)
+                if status == d.STATUSEX_ENDDOWNLOAD then
+                    if doesFileExist(tmp) then
+                        local f = io.open(tmp, 'r')
+                        if f then
+                            local raw = f:read('*a')
+                            f:close()
+                            os.remove(tmp)
+                            local l = raw and decodeJson(raw)
+                            if l and l.updateurl and l.latest then
+                                if l.latest ~= thisScript().version then
+                                    lua_thread.create(function()
+                                        local m = -1
+                                        sampAddChatMessage(prefix .. "Обнаружено обновление. Пытаюсь обновиться c " .. thisScript().version .. " на " .. l.latest, m)
+                                        wait(250)
+                                        local goupdatestatus
+                                        downloadUrlToFile(l.updateurl, thisScript().path, function(_, st, p, q)
+                                            if st == d.STATUS_DOWNLOADINGDATA then
+                                                print(string.format('Загружено %d из %d.', p, q))
+                                            elseif st == d.STATUS_ENDDOWNLOADDATA then
+                                                print('Загрузка обновления завершена.')
+                                                sampAddChatMessage(prefix .. "Обновление завершено!", m)
+                                                goupdatestatus = true
+                                                lua_thread.create(function()
+                                                    wait(500)
+                                                    thisScript():reload()
+                                                end)
+                                            end
+                                            if st == d.STATUSEX_ENDDOWNLOAD then
+                                                if not goupdatestatus then
+                                                    sampAddChatMessage(prefix .. "Обновление прошло неудачно. Запускаю устаревшую версию..", m)
+                                                end
+                                            end
+                                        end)
+                                    end)
+                                else
+                                    print('v' .. thisScript().version .. ': Обновление не требуется.')
+                                end
+                            else
+                                print('v' .. thisScript().version .. ': Неверный version.json или он отсутствует в репозитории.')
+                            end
+                        else
+                            os.remove(tmp)
+                            print('v' .. thisScript().version .. ': Не могу прочитать ответ. Проверьте ' .. tostring(url))
+                        end
+                    end
+                end
+            end)
+            while os.clock() - start < 10 do wait(100) end
+            if os.clock() - start >= 10 then
+                print('v' .. thisScript().version .. ': timeout проверки обновления. ' .. tostring(url))
+            end
         end
-    end
+    }
+    autoupdate_loaded = true
 end
 
 -- Stone
@@ -1220,4 +1278,3 @@ function theme()
     imgui.GetStyle().Colors[imgui.Col.PlotHistogramHovered]   = ImVec4(0.48, 0.48, 0.52, 1.00)
     imgui.GetStyle().Colors[imgui.Col.TextSelectedBg]         = ImVec4(0.28, 0.28, 0.32, 0.85)
 end
-
