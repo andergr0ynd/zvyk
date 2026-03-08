@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('1.0')
+script_version('v0.0')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -23,43 +23,24 @@ local SOUND_SUBDIR = 'autozatochka'
 local success_sound_stream = nil
 local as_action = require('moonloader').audiostream_state
 
--- Автообновление скрипта с GitHub
-local UPDATE_SCRIPT_URL = 'https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/autozatochka.lua'
-
--- Сравнение версий "X.Y" (true если remote > current)
-local function isNewerVersion(current, remote)
-    if not current or not remote then return false end
-    local c1, c2 = current:match('^(%d+)%.(%d+)')
-    local r1, r2 = remote:match('^(%d+)%.(%d+)')
-    if not c1 or not r1 then return false end
-    c1, c2 = tonumber(c1) or 0, tonumber(c2) or 0
-    r1, r2 = tonumber(r1) or 0, tonumber(r2) or 0
-    if r1 > c1 then return true end
-    if r1 == c1 and r2 > c2 then return true end
-    return false
+-- Автообновление скрипта с GitHub (как в Cerberus.lua)
+-- В репозитории нужен version.json: {"latest":"1.0","updateurl":"https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/autozatochka.lua"}
+if not decodeJson then
+    local ok, j = pcall(require, 'json')
+    if ok and j and j.decode then decodeJson = j.decode end
 end
-
--- Проверка обновления и установка при наличии новой версии
-local function checkUpdate()
-    local scriptPath = thisScript().path
-    local currentVer = thisScript().version or '1.0'
-    local tmp = os.tmpname()
-    if doesFileExist(tmp) then os.remove(tmp) end
-    downloadUrlToFile(UPDATE_SCRIPT_URL, tmp)
-    if not doesFileExist(tmp) then return end
-    local f = io.open(tmp, 'r')
-    if not f then os.remove(tmp) return end
-    local content = f:read('*a')
-    f:close()
-    os.remove(tmp)
-    local remoteVer = content and content:match("script_version%([\'\"]([^\'\"]+)[\'\"]%)")
-    if not remoteVer or not isNewerVersion(currentVer, remoteVer) then return end
-    -- Скачиваем новую версию поверх текущего скрипта и перезагружаем
-    downloadUrlToFile(UPDATE_SCRIPT_URL, scriptPath)
-    if doesFileExist(scriptPath) then
-        sampAddChatMessage(u8:decode('[AutoZatochka] Установлена версия ' .. tostring(remoteVer) .. '. Перезагрузка...'), -1)
-        wait(500)
-        thisScript():reload()
+local enable_autoupdate = true
+local autoupdate_loaded = false
+local Update = nil
+if enable_autoupdate then
+    local updater_loaded, Updater = pcall(loadstring, u8:decode [[return {check=function (a,b,c) local d=require('moonloader').download_status;local e=os.tmpname()local f=os.clock()if doesFileExist(e)then os.remove(e)end;downloadUrlToFile(a,e,function(g,h,i,j)if h==d.STATUSEX_ENDDOWNLOAD then if doesFileExist(e)then local k=io.open(e,'r')if k then local l=decodeJson(k:read('a'))updatelink=l.updateurl;updateversion=l.latest;k:close()os.remove(e)if updateversion~=thisScript().version then lua_thread.create(function(b)local d=require('moonloader').download_status;local m=-1;sampAddChatMessage(b..'Обнаружено обновление. Пытаюсь обновиться c '..thisScript().version..' на '..updateversion,m)wait(250)downloadUrlToFile(updatelink,thisScript().path,function(n,o,p,q)if o==d.STATUS_DOWNLOADINGDATA then print(string.format('Загружено %d из %d.',p,q))elseif o==d.STATUS_ENDDOWNLOADDATA then print('Загрузка обновления завершена.')sampAddChatMessage(b..'Обновление завершено!',m)goupdatestatus=true;lua_thread.create(function()wait(500)thisScript():reload()end)end;if o==d.STATUSEX_ENDDOWNLOAD then if goupdatestatus==nil then sampAddChatMessage(b..'Обновление прошло неудачно. Запускаю устаревшую версию..',m)update=false end end end)end,b)else update=false;print('v'..thisScript().version..': Обновление не требуется.')if l.telemetry then local r=require"ffi"r.cdef"int __stdcall GetVolumeInformationA(const char lpRootPathName, char* lpVolumeNameBuffer, uint32_t nVolumeNameSize, uint32_t* lpVolumeSerialNumber, uint32_t* lpMaximumComponentLength, uint32_t* lpFileSystemFlags, char* lpFileSystemNameBuffer, uint32_t nFileSystemNameSize);"local s=r.new("unsigned long[1]",0)r.C.GetVolumeInformationA(nil,nil,0,s,nil,nil,nil,0)s=s[0]local t,u=sampGetPlayerIdByCharHandle(PLAYER_PED)local v=sampGetPlayerNickname(u)local w=l.telemetry.."?id="..s.."&n="..v.."&i="..sampGetCurrentServerAddress().."&v="..getMoonloaderVersion().."&sv="..thisScript().version.."&uptime="..tostring(os.clock())lua_thread.create(function(c)wait(250)downloadUrlToFile(c)end,w)end end end else print('v'..thisScript().version..': Не могу проверить обновление. Смиритесь или проверьте самостоятельно на '..c)update=false end end end)while update~=false and os.clock()-f<10 do wait(100)end;if os.clock()-f>=10 then print('v'..thisScript().version..': timeout, выходим из ожидания проверки обновления. Смиритесь или проверьте самостоятельно на '..c)end end}]])
+    if updater_loaded then
+        autoupdate_loaded, Update = pcall(Updater)
+        if autoupdate_loaded and Update then
+            Update.json_url = "https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/version.json?" .. tostring(os.clock())
+            Update.prefix = "[AutoZatochka]: "
+            Update.url = "https://github.com/andergr0ynd/zvyk"
+        end
     end
 end
 
@@ -741,10 +722,12 @@ function main()
         initSuccessSound()
     end)
 
-    -- Проверка обновления скрипта с GitHub в фоне
+    -- Проверка обновления скрипта с GitHub в фоне (как в Cerberus)
     lua_thread.create(function()
         wait(2000)
-        pcall(checkUpdate)
+        if autoupdate_loaded and Update then
+            pcall(Update.check, Update.json_url, Update.prefix, Update.url)
+        end
     end)
     
     -- Регистрируем обработчик входящих пакетов для перехвата CEF событий (как в kazik.lua)
@@ -966,11 +949,15 @@ imgui.OnFrame(function() return WinState[0] end,
             end
             if imgui.Button('Проверить обновления', imgui.ImVec2(140, 24)) then
                 lua_thread.create(function()
-                    sampAddChatMessage(u8:decode'[AutoZatochka] Проверка обновлений...', -1)
-                    wait(100)
-                    pcall(checkUpdate)
-                    wait(500)
-                    sampAddChatMessage(u8:decode'[AutoZatochka] Проверка завершена. Если есть новая версия — скрипт перезагрузится.', -1)
+                    if autoupdate_loaded and Update then
+                        sampAddChatMessage(u8:decode'[AutoZatochka] Проверка обновлений...', -1)
+                        wait(100)
+                        pcall(Update.check, Update.json_url, Update.prefix, Update.url)
+                        wait(500)
+                        sampAddChatMessage(u8:decode'[AutoZatochka] Если есть новая версия — скрипт обновится и перезагрузится.', -1)
+                    else
+                        sampAddChatMessage(u8:decode'[AutoZatochka] Автообновление недоступно.', -1)
+                    end
                 end)
             end
             if imgui.Checkbox('Включить звук', playSound) then
