@@ -116,23 +116,47 @@ local whetstone_last_check = 0
 local Whetstone_CHECK_INTERVAL_MS = 2000
 
 -- Инициализация звука успешной заточки: скачивание с GitHub и загрузка потока
+local dl_status = pcall(require, 'moonloader') and require('moonloader').download_status
 local function initSuccessSound()
     local dir = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR
     if not doesDirectoryExist(dir) then
         createDirectory(dir)
     end
     local path = dir .. '\\' .. SOUND_FILENAME
-    if not doesFileExist(path) then
-        downloadUrlToFile(SOUND_URL, path)
+    local function tryLoadStream()
+        if doesFileExist(path) and not success_sound_stream then
+            success_sound_stream = loadAudioStream(path)
+        end
     end
-    if doesFileExist(path) and not success_sound_stream then
-        success_sound_stream = loadAudioStream(path)
+    if doesFileExist(path) then
+        tryLoadStream()
+        return
+    end
+    if dl_status then
+        downloadUrlToFile(SOUND_URL, path, function(_, status)
+            if status == dl_status.STATUSEX_ENDDOWNLOAD or status == dl_status.STATUS_ENDDOWNLOADDATA then
+                lua_thread.create(function()
+                    wait(200)
+                    tryLoadStream()
+                end)
+            end
+        end)
+    else
+        downloadUrlToFile(SOUND_URL, path)
+        wait(1500)
+        tryLoadStream()
     end
 end
 
 -- Воспроизведение звука успешной заточки
 local function playSuccessSound()
     if not playSound[0] then return end
+    if not success_sound_stream then
+        local path = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR .. '\\' .. SOUND_FILENAME
+        if doesFileExist(path) then
+            success_sound_stream = loadAudioStream(path)
+        end
+    end
     if success_sound_stream then
         setAudioStreamState(success_sound_stream, as_action.STOP)
         setAudioStreamState(success_sound_stream, as_action.PLAY)
@@ -1000,7 +1024,7 @@ imgui.OnFrame(function() return WinState[0] end,
             end
             if imgui.Button('Перезагрузить скрипт', imgui.ImVec2(140, 24)) then
                 lua_thread.create(function()
-                    sampAddChatMessage(u8:decode'[AutoZatochka] Перезагрузка скрипта...', -1)
+                    sampAddChatMessage('[AutoZatochka] Перезагрузка скрипта...', -1)
                     wait(1000)
                     thisScript():reload()
                 end)
@@ -1008,13 +1032,13 @@ imgui.OnFrame(function() return WinState[0] end,
             if imgui.Button('Проверить обновления', imgui.ImVec2(140, 24)) then
                 lua_thread.create(function()
                     if autoupdate_loaded and Update then
-                        sampAddChatMessage(u8:decode'[AutoZatochka] Проверка обновлений...', -1)
+                        sampAddChatMessage('[AutoZatochka] Проверка обновлений...', -1)
                         wait(100)
                         pcall(Update.check, Update.json_url, Update.prefix, Update.url)
                         wait(500)
-                        sampAddChatMessage(u8:decode'[AutoZatochka] Если есть новая версия — скрипт обновится и перезагрузится.', -1)
+                        sampAddChatMessage('[AutoZatochka] Если есть новая версия — скрипт обновится и перезагрузится.', -1)
                     else
-                        sampAddChatMessage(u8:decode'[AutoZatochka] Автообновление недоступно.', -1)
+                        sampAddChatMessage('[AutoZatochka] Автообновление недоступно.', -1)
                     end
                 end)
             end
