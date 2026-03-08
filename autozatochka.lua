@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v2.0')
+script_version('v3.0')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -1302,5 +1302,6 @@ function theme()
     imgui.GetStyle().Colors[imgui.Col.PlotHistogramHovered]   = ImVec4(0.48, 0.48, 0.52, 1.00)
     imgui.GetStyle().Colors[imgui.Col.TextSelectedBg]         = ImVec4(0.28, 0.28, 0.32, 0.85)
 end
+
 
 
