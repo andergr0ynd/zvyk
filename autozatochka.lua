@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v5.2')
+script_version('v6.0')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -1164,39 +1164,62 @@ function sampev.onShowTextDraw(id, data)
     end
 end
 
--- Паттерны: CP1251 для чата SAMP и UTF-8 на случай, если сервер шлёт в UTF-8
-local PATTERN_FAIL    = u8:decode("Увы, вам не удалось улучшить предмет .* . %+%d+ на %+%d+")
-local PATTERN_SUCCESS = u8:decode("Успех! Вам удалось улучшить предмет .* . %+%d+ на %+(%d+)")
-local PATTERN_OLD     = u8:decode("Отлично! Вы смогли заточить оружие .+ с %+%d+ до %+(%d+)")
-local PATTERN_FAIL_U8    = "Увы, вам не удалось улучшить предмет .* . %+%d+ на %+%d+"
-local PATTERN_SUCCESS_U8 = "Успех! Вам удалось улучшить предмет .* . %+%d+ на %+(%d+)"
+-- Паттерны чата: заточка отслеживается ТОЛЬКО по тексту "с +X на +Y"
+local PATTERN_FAIL       = u8:decode("Увы, вам не удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)")
+local PATTERN_FAIL_U8    = "Увы, вам не удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)"
+local PATTERN_SUCCESS    = u8:decode("Успех! Вам удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)")
+local PATTERN_SUCCESS_U8 = "Успех! Вам удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)"
+
+local function parseEnchantLevelsFromChat(text)
+    local fromLvl, toLvl = text:match(PATTERN_SUCCESS)
+    if not fromLvl then fromLvl, toLvl = text:match(PATTERN_SUCCESS_U8) end
+    if fromLvl and toLvl then
+        return true, tonumber(fromLvl), tonumber(toLvl)
+    end
+
+    fromLvl, toLvl = text:match(PATTERN_FAIL)
+    if not fromLvl then fromLvl, toLvl = text:match(PATTERN_FAIL_U8) end
+    if fromLvl and toLvl then
+        return false, tonumber(fromLvl), tonumber(toLvl)
+    end
+
+    return nil, nil, nil
+end
 
 function sampev.onServerMessage(color, text)
     if max_toch > 0 and text and #text > 0 then
         local t = text:gsub("%{%x%x%x%x%x%x%}", "")  -- убрать коды цветов {FFFFFF} и т.д.
-        -- Неудача
-        if t:find(PATTERN_FAIL) or t:find(PATTERN_FAIL_U8) then
+
+        local isSuccess, fromLvl, toLvl = parseEnchantLevelsFromChat(t)
+        if isSuccess == nil then
+            return
+        end
+
+        if not isSuccess then
             tochi = true
             all_lost = all_lost + 1
             lost_stone_onLVL = lost_stone_onLVL + 1
+            return
         end
-        -- Успех
-        local tochLVL = t:match(PATTERN_SUCCESS) or t:match(PATTERN_SUCCESS_U8)
-        if not tochLVL then tochLVL = t:match(PATTERN_OLD) end
-        if tochLVL then
+
+        if isSuccess and toLvl then
             playSuccessSound()
             lost_stone_onLVL = lost_stone_onLVL + 1
-            tochLVL = tonumber(tochLVL)
             all_lost = all_lost + 1
-            table.insert(lost_stone, {lost_stone_onLVL, tochLVL})
+            table.insert(lost_stone, {lost_stone_onLVL, toLvl})
             lost_stone_onLVL = 0
-            if tochLVL < tonumber(max_toch) then
-                tochi = true
-            elseif tochLVL == tonumber(max_toch) then
+
+            local target = tonumber(max_toch) or 0
+            -- Останавливаемся только на точном успешном переходе c +(target-1) на +target.
+            -- Например для "точить до +12" — только после текста "c +11 на +12".
+            if toLvl == target and fromLvl == (target - 1) then
                 tochi = false
                 max_toch = 0
                 stone_check = false
                 status = false
+                sampAddChatMessage(u8:decode("У вас заточился предмет до указаной вами заточки, выбери другой предмет или другой уровень"), -1)
+            else
+                tochi = true
             end
         end
     end
