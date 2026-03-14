@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v5.0')
+script_version('v5.1')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -58,7 +58,7 @@ if enable_autoupdate and decodeJson then
                                 if l.latest ~= thisScript().version then
                                     lua_thread.create(function()
                                         local m = -1
-                                        sampAddChatMessage(prefix .. "Обнаружено обновление. Пытаюсь обновиться c " .. thisScript().version .. " на " .. l.latest, m)
+                                        sampAddChatMessage(prefix .. u8("Обнаружено обновление. Пытаюсь обновиться c " .. thisScript().version .. " на " .. l.latest), m)
                                         wait(250)
                                         local goupdatestatus
                                         downloadUrlToFile(l.updateurl, thisScript().path, function(_, st, p, q)
@@ -66,7 +66,7 @@ if enable_autoupdate and decodeJson then
                                                 print(string.format('Загружено %d из %d.', p, q))
                                             elseif st == d.STATUS_ENDDOWNLOADDATA then
                                                 print('Загрузка обновления завершена.')
-                                                sampAddChatMessage(prefix .. "Обновление завершено!", m)
+                                                sampAddChatMessage(prefix .. u8("Обновление завершено!"), m)
                                                 goupdatestatus = true
                                                 lua_thread.create(function()
                                                     wait(500)
@@ -75,27 +75,27 @@ if enable_autoupdate and decodeJson then
                                             end
                                             if st == d.STATUSEX_ENDDOWNLOAD then
                                                 if not goupdatestatus then
-                                                    sampAddChatMessage(prefix .. "Обновление прошло неудачно. Запускаю устаревшую версию..", m)
+                                                    sampAddChatMessage(prefix .. u8("Обновление прошло неудачно. Запускаю устаревшую версию.."), m)
                                                 end
                                             end
                                         end)
                                     end)
                                 else
-                                    print('v' .. thisScript().version .. ': Обновление не требуется.')
+                                    print(u8('v' .. thisScript().version .. ': Обновление не требуется.'))
                                 end
                             else
-                                print('v' .. thisScript().version .. ': Неверный version.json или он отсутствует в репозитории.')
+                                print(u8('v' .. thisScript().version .. ': Неверный version.json или он отсутствует в репозитории.'))
                             end
                         else
                             os.remove(tmp)
-                            print('v' .. thisScript().version .. ': Не могу прочитать ответ. Проверьте ' .. tostring(url))
+                            print(u8('v' .. thisScript().version .. ': Не могу прочитать ответ. Проверьте ' .. tostring(url)))
                         end
                     end
                 end
             end)
             while os.clock() - start < 10 do wait(100) end
             if os.clock() - start >= 10 then
-                print('v' .. thisScript().version .. ': timeout проверки обновления. ' .. tostring(url))
+                print(u8('v' .. thisScript().version .. ': timeout проверки обновления. ' .. tostring(url)))
             end
         end
     }
