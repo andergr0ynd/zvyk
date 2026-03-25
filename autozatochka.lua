@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v7.0')
+script_version('v6.8')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -105,7 +105,7 @@ if not decodeJson then
     if ok and j and j.decode then decodeJson = j.decode end
 end
 -- true: фоновая проверка version.json; после успешного обновления покажется окно «ВАЖНО» с changelog
-local enable_autoupdate = false
+local enable_autoupdate = true
 local autoupdate_loaded = false
 local Update = nil
 if enable_autoupdate and decodeJson then
