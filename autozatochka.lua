@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v6.15')
+script_version('v6.17')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -107,12 +107,12 @@ if not decodeJson then
     local ok, j = pcall(require, 'json')
     if ok and j and j.decode then decodeJson = j.decode end
 end
--- true: один раз после входа в игру проверить version.json (кнопка «Проверить обновления» работает всегда при загруженном блоке Update)
-local enable_autoupdate = true
+-- false: без авто-проверки при входе (нет зацикливания); кнопка «Проверить обновления» всегда вызывает Update.check
+local enable_autoupdate = false
 local autoupdate_loaded = false
 local Update = nil
 
--- v6.9 и 6.9 считаем одной версией, иначе обновление зацикливается
+-- v6.9 и 6.9 считаем одной версией; обновление только если удалённая версия численно новее (а не просто строка ~=)
 local function scriptVersionForCompare(ver)
     if ver == nil then return '' end
     local s = tostring(ver):lower():gsub('^%s+', ''):gsub('%s+$', '')
@@ -120,6 +120,37 @@ local function scriptVersionForCompare(ver)
         s = s:sub(2)
     end
     return s
+end
+
+local function versionNumericTuple(ver)
+    local s = scriptVersionForCompare(ver)
+    local t = {}
+    for n in s:gmatch('%d+') do
+        t[#t + 1] = tonumber(n) or 0
+    end
+    if #t == 0 then return nil end
+    return t
+end
+
+--- @return -1 если a старше b, 0 если равны, 1 если a новее b; nil если не удалось разобрать
+local function compareSemanticVersions(a, b)
+    local ta, tb = versionNumericTuple(a), versionNumericTuple(b)
+    if not ta or not tb then return nil end
+    local n = math.max(#ta, #tb)
+    for i = 1, n do
+        local x, y = ta[i] or 0, tb[i] or 0
+        if x < y then return -1 end
+        if x > y then return 1 end
+    end
+    return 0
+end
+
+local function remoteIsNewerThanLocal(localVer, remoteVer)
+    local cmp = compareSemanticVersions(localVer, remoteVer)
+    if cmp ~= nil then
+        return cmp < 0
+    end
+    return false
 end
 
 if decodeJson then
@@ -145,9 +176,9 @@ if decodeJson then
                             os.remove(tmp)
                             local l = raw and decodeJson(raw)
                             if l and l.updateurl and l.latest then
-                                local cur = scriptVersionForCompare(thisScript().version)
-                                local remote = scriptVersionForCompare(l.latest)
-                                if remote ~= '' and cur ~= remote then
+                                local cur = thisScript().version
+                                local remoteNorm = scriptVersionForCompare(l.latest)
+                                if remoteNorm ~= '' and remoteIsNewerThanLocal(cur, l.latest) then
                                     lua_thread.create(function()
                                         local m = -1
                                         sampAddChatMessage(prefix .. u8:decode("Обнаружено обновление. Пытаюсь обновиться c " .. thisScript().version .. " на " .. tostring(l.latest)), m)
