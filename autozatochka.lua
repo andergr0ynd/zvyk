@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v6.1')
+script_version('v7.0')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -23,16 +23,89 @@ local button_id = 0
 local SOUND_URL = 'https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/applepay.mp3'
 local SOUND_FILENAME = 'applepay.mp3'
 local SOUND_SUBDIR = 'autozatochka'
+local PENDING_CHANGELOG_FILE = 'pending_changelog.txt'
 local success_sound_stream = nil
+
+-- Текст для окна после обновления: сначала качается changelog.txt с GitHub, иначе запасной текст
+local CHANGELOG_TXT_URL = 'https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/changelog.txt'
+local changelog_after_update = ''
+
+local function pendingChangelogPath()
+    return getWorkingDirectory() .. '\\' .. SOUND_SUBDIR .. '\\' .. PENDING_CHANGELOG_FILE
+end
+
+local function writePendingChangelog(text)
+    local dir = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR
+    if not doesDirectoryExist(dir) then
+        createDirectory(dir)
+    end
+    local f = io.open(pendingChangelogPath(), 'wb')
+    if f then
+        f:write(text or '')
+        f:close()
+    end
+end
+
+local function loadPendingChangelogIfAny()
+    local p = pendingChangelogPath()
+    if not doesFileExist(p) then return end
+    local f = io.open(p, 'rb')
+    if not f then return end
+    local s = f:read('*a') or ''
+    f:close()
+    if #s == 0 then return end
+    local ok, dec = pcall(function() return u8:decode(s) end)
+    changelog_after_update = (ok and dec) and dec or s
+end
+
+local function pendingChangelogDownloadUsable(path)
+    local fh = io.open(path, 'rb')
+    if not fh then return false end
+    local s = fh:read('*a') or ''
+    fh:close()
+    if #s == 0 then return false end
+    local head = s:sub(1, 12):lower()
+    if head:find('^<!doctype') or head:find('^<html') then return false end
+    return true
+end
+
+-- Скачивает changelog.txt в pending-файл; если не вышло — пишет fallback (UTF-8)
+local function downloadRemoteChangelogOrWriteFallback(fallback_text)
+    local ml = require('moonloader')
+    local d = ml.download_status
+    local dir = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR
+    if not doesDirectoryExist(dir) then
+        createDirectory(dir)
+    end
+    if not d or not downloadUrlToFile then
+        writePendingChangelog(fallback_text)
+        return
+    end
+    local path = pendingChangelogPath()
+    local url = CHANGELOG_TXT_URL .. (CHANGELOG_TXT_URL:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
+    local done = false
+    downloadUrlToFile(url, path, function(_, st)
+        if st == d.STATUSEX_ENDDOWNLOAD or st == d.STATUS_ENDDOWNLOADDATA then
+            done = true
+        end
+    end)
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < 22 do wait(50) end
+    if not pendingChangelogDownloadUsable(path) then
+        writePendingChangelog(fallback_text)
+    end
+end
+
 local as_action = require('moonloader').audiostream_state
 
 -- Автообновление скрипта с GitHub (как в Cerberus.lua, с проверкой на nil)
--- В репозитории нужен version.json: {"latest":"1.0","updateurl":"https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/autozatochka.lua"}
+-- version.json: latest, updateurl; опционально changelog — запас, если changelog.txt пустой/недоступен
 if not decodeJson then
     local ok, j = pcall(require, 'json')
     if ok and j and j.decode then decodeJson = j.decode end
 end
-local enable_autoupdate = true
+-- true: фоновая проверка version.json; после успешного обновления покажется окно «ВАЖНО» с changelog
+local enable_autoupdate = false
 local autoupdate_loaded = false
 local Update = nil
 if enable_autoupdate and decodeJson then
@@ -71,8 +144,18 @@ if enable_autoupdate and decodeJson then
                                                 print('Загрузка обновления завершена.')
                                                 sampAddChatMessage(prefix .. u8:decode("Обновление завершено!"), m)
                                                 goupdatestatus = true
+                                                local ch = l.changelog or l.changes or l.notes
+                                                local fallback
+                                                if type(ch) == 'string' and #ch > 0 then
+                                                    fallback = ch
+                                                else
+                                                    fallback = u8:decode('Скрипт обновлён до версии ') .. tostring(l.latest)
+                                                        .. u8:decode('.\n\nСписок изменений: файл changelog.txt в репозитории zvyk (или поле changelog в version.json).')
+                                                end
                                                 lua_thread.create(function()
-                                                    wait(500)
+                                                    wait(350)
+                                                    downloadRemoteChangelogOrWriteFallback(fallback)
+                                                    wait(150)
                                                     thisScript():reload()
                                                 end)
                                             end
@@ -192,13 +275,10 @@ local tochi, workshop_check, stone_check = false, false, false
 local lost_stone_onLVL, all_lost = 0, 0
 local stone = {}
 local lost_stone = {}
-local enchantSlotsData = {index = -1, left = -1, right = -1, color = -1}
+local enchantSlotsData = { index = -1, left = -1 }
 
--- ID точильного камня из MiniHelper/items_num.lua: [1187] = "Точильный камень"
+-- ID точильного камня: [1187] = "Точильный камень"
 local Whetstone_ITEM_ID = 1187
-local whetstone_detected = false
-local whetstone_last_check = 0
-local Whetstone_CHECK_INTERVAL_MS = 2000
 
 -- Инициализация звука успешной заточки: скачивание с GitHub и загрузка потока
 local dl_status = pcall(require, 'moonloader') and require('moonloader').download_status
@@ -281,11 +361,6 @@ function evalcef(code, encoded)
 end
 
 -- == Функции отправки CEF команд == --
-function sendCEFEvent(eventName, params)
-    local code = string.format("window.executeEvent('%s', `%s`);", eventName, params)
-    evalcef(code, 0)
-end
-
 function sendCEF(str)
     if arizona and arizona.send then
         arizona.send('onArizonaSend', { text = str, server_id = 0 })
@@ -299,10 +374,6 @@ function sendCEF(str)
     raknetBitStreamWriteInt32(bs, 0)
     raknetSendBitStream(bs)
     raknetDeleteBitStream(bs)
-end
-
-function setActiveView(viewName)
-    sendCEFEvent('event.setActiveView', string.format('[%q]', viewName))
 end
 
 -- == Функции работы с CEF == --
@@ -338,67 +409,7 @@ function moveItem(fromSlot, fromType, toSlot, toType, amount)
     sendCEF('inventory.moveItem|'..json)
 end
 
--- Проверяет, есть ли точильный камень в инвентаре (по id 1187 или по названию "Точильный камень").
-function hasWhetstoneInInventory()
-    return getWhetstoneCount() > 0
-end
-
--- Варианты названия предмета в игре (для поиска в CEF по тексту)
-local Whetstone_NAMES = { "Точильный камень", "Точильный камень (Заточка)" }
--- Ключевые подстроки: если в alt/title/text есть одна из них — считаем точильным камнем
 local Whetstone_KEYWORDS = { "Точильный камень", "точильный камень", "Заточка", "заточка" }
-
--- Возвращает количество точильных камней в инвентаре через CEF (по id 1187 или по названию).
-function getWhetstoneCount()
-    local keywordsEsc = {}
-    for _, kw in ipairs(Whetstone_KEYWORDS) do
-        keywordsEsc[#keywordsEsc + 1] = (kw):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\r", ""):gsub("\n", "\\n")
-    end
-    local kwList = table.concat(keywordsEsc, '","')
-    local result = evalanon(string.format([[
-        (function() {
-            try {
-                var count = 0;
-                var keywords = ["%s"];
-                var containers = document.querySelectorAll('.inventory-main__grid, .inventory-grid__grid, .warehouse .inventory-grid__grid, [class*="inventory-grid"], [class*="inventory-main"], .inventory-container, [class*="inventory"]');
-                for (var c = 0; c < containers.length; c++) {
-                    var items = containers[c].querySelectorAll('.inventory-item-hoc, .inventory-grid__item-bg, [class*="inventory-item"], [class*="item"]');
-                    for (var i = 0; i < items.length; i++) {
-                        var item = items[i];
-                        var img = item.querySelector('.inventory-item__image, img');
-                        var alt = img ? (img.getAttribute('alt') || '') : '';
-                        var title = img ? (img.getAttribute('title') || '') : '';
-                        var src = img ? (img.getAttribute('src') || '') : '';
-                        var text = (item.innerText || item.textContent || '').toString();
-                        var combined = alt + ' ' + title + ' ' + text;
-                        var m = alt.match(/\d+/); var m2 = src.match(/\d+/);
-                        var id = parseInt(m ? m[0] : 0) || parseInt(m2 ? m2[0] : 0) || 0;
-                        var byName = false;
-                        for (var k = 0; k < keywords.length; k++) {
-                            if (combined.indexOf(keywords[k]) !== -1) { byName = true; break; }
-                        }
-                        if (id === 1187 || byName) count++;
-                    }
-                }
-                var byAttr = document.querySelectorAll('[data-item-id="1187"], [data-model="1187"], [data-id="1187"], img[alt*="1187"]');
-                if (byAttr.length > 0 && count === 0) count = byAttr.length;
-                if (count > 0) return count;
-                var allImgs = document.querySelectorAll('img[alt], [class*="item"] img, [class*="inventory"] img');
-                for (var j = 0; j < allImgs.length; j++) {
-                    var a = (allImgs[j].getAttribute('alt') || '') + (allImgs[j].getAttribute('title') || '');
-                    var par = allImgs[j].parentElement;
-                    if (par && (par.innerText || par.textContent)) a += (par.innerText || par.textContent).toString();
-                    for (var k = 0; k < keywords.length; k++) {
-                        if (a.indexOf(keywords[k]) !== -1) { count++; break; }
-                    }
-                }
-                return count;
-            } catch(e) { return 0; }
-        })();
-    ]], kwList))
-    local n = tonumber(result)
-    return (n and n >= 0) and n or 0
-end
 
 function findStoneSlotNumber()
     local kwEsc = (Whetstone_KEYWORDS[1]):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\r", ""):gsub("\n", "\\n")
@@ -513,7 +524,6 @@ function findEnchantSlotNumber()
         }
     ]])
     wait(100)
-    -- Получаем номер слота из JavaScript
     local slotNum = evalanon([[
         return window.enchantSlotNumber !== undefined ? window.enchantSlotNumber : -1;
     ]])
@@ -847,38 +857,21 @@ function click_onStone()
     -- Сначала проверяем CEF интерфейс, если workshop_check еще не установлен
     if not workshop_check then
         checkWorkshopStatus()
-        -- Проверяем результат через еще один вызов
-        evalanon([[
-            if (window.workshopDetected === true) {
-                window.workshopCheckResult = 1;
-            }
-        ]])
     end
-    
+
     if #stone == 0 then
         if workshop_check then
             -- Пытаемся найти камень через CEF
             findAndClickStone()
             tochi = workshop_check
         else
-            -- Последняя попытка проверить через CEF перед сообщением об ошибке
             checkWorkshopStatus()
-            -- Если верстак обнаружен, устанавливаем флаг
-            evalanon([[
-                const bodyText = (document.body.innerText || '').toUpperCase();
-                if (bodyText.includes('WORKSHOP') || bodyText.includes('ВЕРСТАК') || bodyText.includes('ENCHANT') || bodyText.includes('ЗАТОЧКА') ||
-                    document.querySelectorAll('[data-item-id="1187"], [data-model="1187"]').length > 0 ||
-                    window.workshopDetected === true) {
-                    window.forceWorkshopOpen = true;
-                }
-            ]])
-            -- Устанавливаем флаг если верстак найден
             workshop_check = true
             findAndClickStone()
             tochi = true
         end
     else
-        for k,v in pairs(stone) do
+        for _, v in pairs(stone) do
             sampSendClickTextdraw(v[1])
             tochi = (workshop_check and true or false)
             break
@@ -895,12 +888,8 @@ local function onCefIncomingText17(str)
         if jsonData then
             local index = jsonData:match('"index":(%d+)') or jsonData:match('"index":(%-?%d+)')
             local left = jsonData:match('"left":(%d+)') or jsonData:match('"left":(%-?%d+)')
-            local right = jsonData:match('"right":(%d+)') or jsonData:match('"right":(%-?%d+)')
-            local color = jsonData:match('"color":(%d+)') or jsonData:match('"color":(%-?%d+)')
             if index then enchantSlotsData.index = tonumber(index) end
             if left then enchantSlotsData.left = tonumber(left) end
-            if right then enchantSlotsData.right = tonumber(right) end
-            if color then enchantSlotsData.color = tonumber(color) end
             if enchantSlotsData.left == -1 and status and max_toch > 0 and not tochi then
                 lua_thread.create(function()
                     wait(300)
@@ -909,19 +898,12 @@ local function onCefIncomingText17(str)
             end
         end
     end
-    if str:find('onActiveViewChanged') then
-        local view = str:match('onActiveViewChanged|(%w+)')
-        if view == 'Inventory' then
-        end
-    end
 end
 
 local function onCefIncomingText18(data)
     if not data then return end
     if data:find('updateEnchantSlots') then
         workshop_check = true
-    end
-    if data:find('startEnchant') then
     end
 end
 
@@ -965,6 +947,8 @@ function main()
         end
     end
 
+    loadPendingChangelogIfAny()
+
     -- Загрузка звука успешной заточки с GitHub в фоне
     lua_thread.create(function()
         wait(500)
@@ -1004,19 +988,10 @@ function main()
         end)
     end
     
-    -- Фоновое обновление статуса точильного камня (не вызываем evalanon из imgui — там всегда 0)
-    lua_thread.create(function()
-        while true do
-            wait(Whetstone_CHECK_INTERVAL_MS)
-            whetstone_detected = (getWhetstoneCount() > 0)
-        end
-    end)
-
     -- Устанавливаем обработчики CEF событий через JavaScript
     evalanon([[
         window.enchantInterfaceOpen = false;
         window.workshopOpen = false;
-        window.inventoryOpen = false;
         
         // Периодическая проверка наличия верстака
         setInterval(function() {
@@ -1068,18 +1043,7 @@ function main()
             elseif status and max_toch > 0 and not workshop_check then
                 -- Периодически проверяем, не открылся ли верстак через CEF
                 wait(2000)
-                -- Проверяем через CEF
                 checkWorkshopStatus()
-                -- Устанавливаем флаг если верстак найден (более агрессивная проверка)
-                evalanon([[
-                    const bodyText = (document.body.innerText || '').toUpperCase();
-                    if (bodyText.includes('WORKSHOP') || bodyText.includes('ВЕРСТАК') || bodyText.includes('ENCHANT') || bodyText.includes('ЗАТОЧКА') ||
-                        document.querySelectorAll('[data-item-id="1187"], [data-model="1187"]').length > 0 ||
-                        window.workshopDetected === true || window.workshopOpen === true || window.enchantInterfaceOpen === true) {
-                        window.workshopShouldBeOpen = true;
-                    }
-                ]])
-                -- Устанавливаем флаг (предполагаем что верстак открыт если скрипт активен)
                 workshop_check = true
                 wait(500)
                 click_onStone()
@@ -1173,45 +1137,32 @@ imgui.OnFrame(function() return WinState[0] end,
     end
 )
 
--- == Проверка CEF интерфейса верстака == --
-function checkEnchantInterface()
-    evalanon([[
-        try {
-            const bodyText = (document.body.innerText || document.body.textContent || '').toUpperCase();
-            const hasEnchantSlots = document.querySelectorAll('[class*="enchant"], [class*="Enchant"], [id*="enchant"], [id*="Enchant"], [class*="workshop"], [class*="Workshop"], [id*="workshop"]').length > 0;
-            const hasEnchantText = bodyText.includes('ENCHANT') || bodyText.includes('ЗАТОЧКА') || bodyText.includes('ВЕРСТАК') || bodyText.includes('WORKSHOP');
-            const hasUpdateEnchant = window.enchantInterfaceOpen === true;
-            
-            // Поиск камней через структуру инвентаря (как в sorting.lua)
-            const inventoryItems = document.querySelectorAll('.inventory-item-hoc');
-            let hasStoneElements = false;
-            for (let item of inventoryItems) {
-                const img = item.querySelector('.inventory-item__image');
-                if (img) {
-                    const alt = img.getAttribute('alt') || '';
-                    const itemId = parseInt(alt.match(/\d+/)?.[0]) || 0;
-                    if (itemId === 1187) {
-                        hasStoneElements = true;
-                        break;
-                    }
-                }
-            }
-            
-            // Также проверяем через другие селекторы
-            if (!hasStoneElements) {
-                hasStoneElements = document.querySelectorAll('[data-item-id="1187"], [data-model="1187"], [data-id="1187"], img[alt*="1187"]').length > 0;
-            }
-            
-            if (hasEnchantSlots || hasEnchantText || hasUpdateEnchant || hasStoneElements) {
-                window.workshopOpen = true;
-                return true;
-            }
-            return false;
-        } catch(e) {
-            return false;
-        }
-    ]])
-end
+-- Окно списка изменений после обновления
+imgui.OnFrame(function()
+    return changelog_after_update ~= ''
+end, function()
+    local io = imgui.GetIO()
+    local w = io.DisplaySize.x
+    imgui.SetNextWindowPos(imgui.ImVec2(w * 0.5, io.DisplaySize.y * 0.5), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+    imgui.SetNextWindowSize(imgui.ImVec2(500, 0), imgui.Cond.FirstUseEver)
+    local wf = imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoCollapse
+    if imgui.Begin(u8:decode('ВАЖНО — обновление AutoZatochka'), nil, wf) then
+        imgui.TextColored(imgui.ImVec4(1, 0.35, 0.12, 1), u8:decode('Список изменений'))
+        imgui.Separator()
+        imgui.BeginChild('##changelog_scroll', imgui.ImVec2(460, 240), true)
+        imgui.TextWrapped(changelog_after_update)
+        imgui.EndChild()
+        imgui.Spacing()
+        if imgui.Button(u8:decode('Понятно'), imgui.ImVec2(220, 34)) then
+            local pth = pendingChangelogPath()
+            if doesFileExist(pth) then
+                pcall(os.remove, pth)
+            end
+            changelog_after_update = ''
+        end
+        imgui.End()
+    end
+end)
 
 -- == Проверка и установка флага верстака == --
 function checkWorkshopStatus()
@@ -1343,9 +1294,9 @@ function sampev.onServerMessage(color, text)
     end
 end
 
--- == Other shit == --
 function imgui.ColoredButton(text, size, hex, trans)
     local r,g,b = tonumber("0x"..hex:sub(1,2)), tonumber("0x"..hex:sub(3,4)), tonumber("0x"..hex:sub(5,6))
+    local a
     if tonumber(trans) ~= nil and tonumber(trans) < 101 and tonumber(trans) > 0 then
         a = trans
     else a = 60 end
@@ -1359,6 +1310,7 @@ end
 
 function imgui.ColSeparator(hex, trans)
     local r,g,b = tonumber("0x"..hex:sub(1,2)), tonumber("0x"..hex:sub(3,4)), tonumber("0x"..hex:sub(5,6))
+    local a
     if tonumber(trans) ~= nil and tonumber(trans) < 101 and tonumber(trans) > 0 then
         a = trans
     else a = 100 end
