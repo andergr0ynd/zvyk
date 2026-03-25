@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v6.0')
+script_version('v6.1')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -9,6 +9,9 @@ local encoding = require 'encoding'
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local new = imgui.new
+
+-- Arizona CEF: подключается в main() после проверки файлов (см. bootstrap библиотек)
+local arizona = nil
 
 -- == Settings == --
 local WinState, playSound = new.bool(), new.bool()
@@ -102,6 +105,88 @@ if enable_autoupdate and decodeJson then
     autoupdate_loaded = true
 end
 
+-- Синхронизация lib/arizona-events с GitHub → moonloader\lib\arizona-events
+-- Источник на GitHub: zvyk/arizona-events/*.lua (raw). На диск: moonloader\lib\arizona-events\
+-- Если файлов нет или они битые — скрипт качает, перезагружается, затем продолжает работу.
+local LIB_ARIZONA_EVENTS_BASE = 'https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/arizona-events/'
+local LIB_ARIZONA_EVENTS_DIR = 'lib\\arizona-events'
+local LIB_ARIZONA_EVENTS_FILES = { 'init.lua', 'core.lua', 'bitstream.lua', 'subprocess.lua' }
+
+local function libFileLooksBad(path)
+    local f = io.open(path, 'rb')
+    if not f then return true end
+    local s = f:read('*a') or ''
+    f:close()
+    if #s < 32 then return true end
+    local head = s:sub(1, 12):lower()
+    if head:find('^<!doctype') or head:find('^<html') then return true end
+    return false
+end
+
+local function arizonaEventsLibPaths()
+    local root = getWorkingDirectory()
+    local dir = root .. '\\' .. LIB_ARIZONA_EVENTS_DIR
+    return root, dir
+end
+
+-- У части пользователей нет папки lib\arizona-events — создаём lib и вложенную arizona-events отдельно
+local function ensureArizonaEventsLibDir()
+    local root, dir = arizonaEventsLibPaths()
+    local libDir = root .. '\\lib'
+    if not doesDirectoryExist(libDir) then
+        createDirectory(libDir)
+    end
+    if not doesDirectoryExist(dir) then
+        createDirectory(dir)
+    end
+end
+
+local function arizonaEventsLibPresent()
+    local _, dir = arizonaEventsLibPaths()
+    for _, name in ipairs(LIB_ARIZONA_EVENTS_FILES) do
+        local path = dir .. '\\' .. name
+        if not doesFileExist(path) or libFileLooksBad(path) then
+            return false
+        end
+    end
+    return true
+end
+
+-- force_all: скачать все файлы заново (первый запуск / восстановление)
+-- возвращает true, если после операции все четыре файла на месте и валидны
+local function syncArizonaEventsLib(force_all)
+    ensureArizonaEventsLibDir()
+    local ml = require('moonloader')
+    local d = ml.download_status
+    if not d or not downloadUrlToFile then
+        return false
+    end
+    local _, dir = arizonaEventsLibPaths()
+    for _, name in ipairs(LIB_ARIZONA_EVENTS_FILES) do
+        local path = dir .. '\\' .. name
+        local need = force_all or not doesFileExist(path) or libFileLooksBad(path)
+        if need then
+            local url = LIB_ARIZONA_EVENTS_BASE .. name
+            url = url .. (url:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
+            local done, ok = false, false
+            downloadUrlToFile(url, path, function(_, status)
+                if status == d.STATUSEX_ENDDOWNLOAD or status == d.STATUS_ENDDOWNLOADDATA then
+                    ok = doesFileExist(path) and not libFileLooksBad(path)
+                    done = true
+                end
+            end)
+            local start = os.clock()
+            while not done and os.clock() - start < 45 do wait(50) end
+            if ok then
+                print('[AutoZatochka] ' .. u8:decode('Библиотека сохранена: ') .. LIB_ARIZONA_EVENTS_DIR .. '\\' .. name)
+            else
+                print('[AutoZatochka] ' .. u8:decode('Не удалось скачать: ') .. name)
+            end
+        end
+    end
+    return arizonaEventsLibPresent()
+end
+
 -- Stone
 local tochi, workshop_check, stone_check = false, false, false
 local lost_stone_onLVL, all_lost = 0, 0
@@ -181,6 +266,10 @@ end
 
 function evalcef(code, encoded)
     encoded = encoded or 0
+    if arizona and arizona.eval and encoded == 0 then
+        arizona.eval(code, 0)
+        return
+    end
     local bs = raknetNewBitStream()
     raknetBitStreamWriteInt8(bs, 17)
     raknetBitStreamWriteInt32(bs, 0)
@@ -198,7 +287,10 @@ function sendCEFEvent(eventName, params)
 end
 
 function sendCEF(str)
-    -- Правильная отправка CEF команд (как в kazik.lua)
+    if arizona and arizona.send then
+        arizona.send('onArizonaSend', { text = str, server_id = 0 })
+        return
+    end
     local bs = raknetNewBitStream()
     raknetBitStreamWriteInt8(bs, 220)
     raknetBitStreamWriteInt8(bs, 18)
@@ -382,7 +474,7 @@ function findEnchantSlotNumber()
                             
                             // Метод 1: data-slot атрибут
                             const slotAttr = slot.getAttribute('data-slot');
-                            if (slotAttr && slotAttr ~= 'left') {
+                            if (slotAttr && slotAttr !== 'left') {
                                 slotNum = parseInt(slotAttr);
                             }
                             
@@ -794,9 +886,84 @@ function click_onStone()
     end
 end
 
+-- Разбор входящих CEF-строк (тип 17 / 18 пакета 220): общая логика для arizona-events и fallback
+local function onCefIncomingText17(str)
+    if not str or #str == 0 then return end
+    if str:find('updateEnchantSlots') then
+        workshop_check = true
+        local jsonData = str:match('updateEnchantSlots|(.+)')
+        if jsonData then
+            local index = jsonData:match('"index":(%d+)') or jsonData:match('"index":(%-?%d+)')
+            local left = jsonData:match('"left":(%d+)') or jsonData:match('"left":(%-?%d+)')
+            local right = jsonData:match('"right":(%d+)') or jsonData:match('"right":(%-?%d+)')
+            local color = jsonData:match('"color":(%d+)') or jsonData:match('"color":(%-?%d+)')
+            if index then enchantSlotsData.index = tonumber(index) end
+            if left then enchantSlotsData.left = tonumber(left) end
+            if right then enchantSlotsData.right = tonumber(right) end
+            if color then enchantSlotsData.color = tonumber(color) end
+            if enchantSlotsData.left == -1 and status and max_toch > 0 and not tochi then
+                lua_thread.create(function()
+                    wait(300)
+                    click_onStone()
+                end)
+            end
+        end
+    end
+    if str:find('onActiveViewChanged') then
+        local view = str:match('onActiveViewChanged|(%w+)')
+        if view == 'Inventory' then
+        end
+    end
+end
+
+local function onCefIncomingText18(data)
+    if not data then return end
+    if data:find('updateEnchantSlots') then
+        workshop_check = true
+    end
+    if data:find('startEnchant') then
+    end
+end
+
 function main()
     while not isSampAvailable() do wait(100) end
     sampRegisterChatCommand('mt', function() WinState[0] = not WinState[0] end)
+
+    -- У кого нет lib/arizona-events: синхронная докачка → перезагрузка скрипта → уже с require
+    if not arizonaEventsLibPresent() then
+        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Не найдены библиотеки arizona-events. Скачиваю с GitHub…'), -1)
+        local ok = syncArizonaEventsLib(true)
+        if ok then
+            sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Загрузка завершена. Перезапуск скрипта…'), -1)
+            wait(400)
+            thisScript():reload()
+        else
+            sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Скачивание не удалось. Проверьте сеть и папку zvyk/arizona-events на GitHub.'), -1)
+        end
+        return
+    end
+
+    do
+        local ok_load, mod = pcall(require, 'arizona-events')
+        if ok_load and mod then
+            arizona = mod
+        else
+            arizona = nil
+        end
+    end
+
+    if arizona then
+        arizona.onArizonaDisplay = function(packet)
+            if packet and packet.text then
+                onCefIncomingText17(packet.text)
+            end
+        end
+        arizona.onArizonaIncomingCef18 = function(packet)
+            if packet and packet.text then
+                onCefIncomingText18(packet.text)
+            end
+        end
+    end
 
     -- Загрузка звука успешной заточки с GitHub в фоне
     lua_thread.create(function()
@@ -812,79 +979,30 @@ function main()
         end
     end)
     
-    -- Регистрируем обработчик входящих пакетов для перехвата CEF событий (как в kazik.lua)
-    addEventHandler('onReceivePacket', function(id, bs)
-        if id ~= 220 then return end
-        raknetBitStreamIgnoreBits(bs, 8) -- пропускаем ID пакета (220)
-        local packetType = raknetBitStreamReadInt8(bs)
-        
-        -- Тип 17 = входящие CEF команды (как в kazik.lua)
-        if packetType == 17 then
-            raknetBitStreamIgnoreBits(bs, 32) -- пропускаем 4 байта (0, 0, 0, 0)
-            local length = raknetBitStreamReadInt16(bs)
-            local encoded = raknetBitStreamReadInt8(bs)
-            
-            if length > 0 then
-                -- Правильная обработка закодированных пакетов (как в kazik.lua)
-                local str = (encoded ~= 0) and raknetBitStreamDecodeString(bs, length + encoded) or raknetBitStreamReadString(bs, length)
-                if not str then return end
-                
-                -- Обработка события updateEnchantSlots - это означает что верстак открыт!
-                if str:find('updateEnchantSlots') then
-                    workshop_check = true
-                    -- Парсим данные после | (формат: updateEnchantSlots|{"index":63,"left":-1,"right":29,"color":-1})
-                    local jsonData = str:match('updateEnchantSlots|(.+)')
-                    if jsonData then
-                        -- Сохраняем данные о слотах
-                        local index = jsonData:match('"index":(%d+)') or jsonData:match('"index":(%-?%d+)')
-                        local left = jsonData:match('"left":(%d+)') or jsonData:match('"left":(%-?%d+)')
-                        local right = jsonData:match('"right":(%d+)') or jsonData:match('"right":(%-?%d+)')
-                        local color = jsonData:match('"color":(%d+)') or jsonData:match('"color":(%-?%d+)')
-                        
-                        if index then enchantSlotsData.index = tonumber(index) end
-                        if left then enchantSlotsData.left = tonumber(left) end
-                        if right then enchantSlotsData.right = tonumber(right) end
-                        if color then enchantSlotsData.color = tonumber(color) end
-                        
-                        -- Если left = -1, значит левый слот пустой, нужно положить камень
-                        if enchantSlotsData.left == -1 and status and max_toch > 0 and not tochi then
-                            lua_thread.create(function()
-                                wait(300)
-                                click_onStone()
-                            end)
-                        end
-                    end
+    -- Пакет 220 разбирает lib arizona-events (onArizonaDisplay / onArizonaIncomingCef18). Если библиотека не загрузилась — вручную.
+    if not arizona then
+        addEventHandler('onReceivePacket', function(id, bs)
+            if id ~= 220 then return end
+            raknetBitStreamIgnoreBits(bs, 8)
+            local packetType = raknetBitStreamReadInt8(bs)
+            if packetType == 17 then
+                raknetBitStreamIgnoreBits(bs, 32)
+                local length = raknetBitStreamReadInt16(bs)
+                local encoded = raknetBitStreamReadInt8(bs)
+                if length > 0 then
+                    local str = (encoded ~= 0) and raknetBitStreamDecodeString(bs, length + encoded) or raknetBitStreamReadString(bs, length)
+                    if str then onCefIncomingText17(str) end
                 end
-                
-                -- Обработка события onActiveViewChanged
-                if str:find('onActiveViewChanged') then
-                    local view = str:match('onActiveViewChanged|(%w+)')
-                    if view == 'Inventory' then
-                        -- Инвентарь открыт
-                    end
+            elseif packetType == 18 then
+                local dataLength = raknetBitStreamReadInt16(bs)
+                local encoded = raknetBitStreamReadInt8(bs)
+                if dataLength > 0 then
+                    local data = (encoded ~= 0) and raknetBitStreamDecodeString(bs, dataLength + encoded) or raknetBitStreamReadString(bs, dataLength)
+                    if data then onCefIncomingText18(data) end
                 end
             end
-        end
-        
-        -- Тип 18 = события CEF (альтернативный формат, включая startEnchant)
-        if packetType == 18 then
-            local dataLength = raknetBitStreamReadInt16(bs)
-            local encoded = raknetBitStreamReadInt8(bs)
-            
-            if dataLength > 0 then
-                local data = (encoded ~= 0) and raknetBitStreamDecodeString(bs, dataLength + encoded) or raknetBitStreamReadString(bs, dataLength)
-                if data then
-                    if data:find('updateEnchantSlots') then
-                        workshop_check = true
-                    end
-                    -- Обработка события startEnchant (если приходит от сервера)
-                    if data:find('startEnchant') then
-                        -- Событие начала заточки получено
-                    end
-                end
-            end
-        end
-    end)
+        end)
+    end
     
     -- Фоновое обновление статуса точильного камня (не вызываем evalanon из imgui — там всегда 0)
     lua_thread.create(function()
