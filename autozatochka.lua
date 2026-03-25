@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v2.0')
+script_version('v6.11')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -104,11 +104,22 @@ if not decodeJson then
     local ok, j = pcall(require, 'json')
     if ok and j and j.decode then decodeJson = j.decode end
 end
--- true: фоновая проверка version.json; после успешного обновления покажется окно «ВАЖНО» с changelog
-local enable_autoupdate = true
+-- true: один раз после входа в игру проверить version.json (кнопка «Проверить обновления» работает всегда при загруженном блоке Update)
+local enable_autoupdate = false
 local autoupdate_loaded = false
 local Update = nil
-if enable_autoupdate and decodeJson then
+
+-- v6.9 и 6.9 считаем одной версией, иначе обновление зацикливается
+local function scriptVersionForCompare(ver)
+    if ver == nil then return '' end
+    local s = tostring(ver):lower():gsub('^%s+', ''):gsub('%s+$', '')
+    if s:sub(1, 1) == 'v' then
+        s = s:sub(2)
+    end
+    return s
+end
+
+if decodeJson then
     local d = require('moonloader').download_status
     Update = {
         json_url = "https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/version.json",
@@ -131,36 +142,59 @@ if enable_autoupdate and decodeJson then
                             os.remove(tmp)
                             local l = raw and decodeJson(raw)
                             if l and l.updateurl and l.latest then
-                                if l.latest ~= thisScript().version then
+                                local cur = scriptVersionForCompare(thisScript().version)
+                                local remote = scriptVersionForCompare(l.latest)
+                                if remote ~= '' and cur ~= remote then
                                     lua_thread.create(function()
                                         local m = -1
-                                        sampAddChatMessage(prefix .. u8:decode("Обнаружено обновление. Пытаюсь обновиться c " .. thisScript().version .. " на " .. l.latest), m)
+                                        sampAddChatMessage(prefix .. u8:decode("Обнаружено обновление. Пытаюсь обновиться c " .. thisScript().version .. " на " .. tostring(l.latest)), m)
                                         wait(250)
-                                        local goupdatestatus
-                                        downloadUrlToFile(l.updateurl, thisScript().path, function(_, st, p, q)
+                                        local goupdatestatus = false
+                                        local scriptPath = thisScript().path
+                                        local function commitScriptUpdateAfterDownload()
+                                            if goupdatestatus then return end
+                                            goupdatestatus = true
+                                            print('Загрузка обновления завершена.')
+                                            sampAddChatMessage(prefix .. u8:decode("Обновление завершено!"), m)
+                                            local ch = l.changelog or l.changes or l.notes
+                                            local fallback
+                                            if type(ch) == 'string' and #ch > 0 then
+                                                fallback = ch
+                                            else
+                                                fallback = u8:decode('Скрипт обновлён до версии ') .. tostring(l.latest)
+                                                    .. u8:decode('.\n\nСписок изменений: файл changelog.txt в репозитории zvyk (или поле changelog в version.json).')
+                                            end
+                                            lua_thread.create(function()
+                                                wait(350)
+                                                downloadRemoteChangelogOrWriteFallback(fallback)
+                                                wait(150)
+                                                thisScript():reload()
+                                            end)
+                                        end
+                                        local function scriptFileLooksLikeLua(path)
+                                            local fh = io.open(path, 'rb')
+                                            if not fh then return false end
+                                            local s = fh:read('*a') or ''
+                                            fh:close()
+                                            if #s < 80 then return false end
+                                            local h = s:sub(1, 14):lower()
+                                            if h:find('^<!doctype') or h:find('^<html') then return false end
+                                            return s:find('function') ~= nil or s:find('script_name') ~= nil or s:find('require') ~= nil
+                                        end
+                                        downloadUrlToFile(l.updateurl, scriptPath, function(_, st, p, q)
                                             if st == d.STATUS_DOWNLOADINGDATA then
                                                 print(string.format('Загружено %d из %d.', p, q))
                                             elseif st == d.STATUS_ENDDOWNLOADDATA then
-                                                print('Загрузка обновления завершена.')
-                                                sampAddChatMessage(prefix .. u8:decode("Обновление завершено!"), m)
-                                                goupdatestatus = true
-                                                local ch = l.changelog or l.changes or l.notes
-                                                local fallback
-                                                if type(ch) == 'string' and #ch > 0 then
-                                                    fallback = ch
-                                                else
-                                                    fallback = u8:decode('Скрипт обновлён до версии ') .. tostring(l.latest)
-                                                        .. u8:decode('.\n\nСписок изменений: файл changelog.txt в репозитории zvyk (или поле changelog в version.json).')
-                                                end
-                                                lua_thread.create(function()
-                                                    wait(350)
-                                                    downloadRemoteChangelogOrWriteFallback(fallback)
-                                                    wait(150)
-                                                    thisScript():reload()
-                                                end)
+                                                commitScriptUpdateAfterDownload()
                                             end
                                             if st == d.STATUSEX_ENDDOWNLOAD then
-                                                if not goupdatestatus then
+                                                if goupdatestatus then
+                                                    return
+                                                end
+                                                -- Часто приходит только STATUSEX_ENDDOWNLOAD без STATUS_ENDDOWNLOADDATA
+                                                if doesFileExist(scriptPath) and scriptFileLooksLikeLua(scriptPath) then
+                                                    commitScriptUpdateAfterDownload()
+                                                else
                                                     sampAddChatMessage(prefix .. u8:decode("Обновление прошло неудачно. Запускаю устаревшую версию.."), m)
                                                 end
                                             end
@@ -955,13 +989,15 @@ function main()
         initSuccessSound()
     end)
 
-    -- Проверка обновления скрипта с GitHub в фоне (как в Cerberus)
-    lua_thread.create(function()
-        wait(2000)
-        if autoupdate_loaded and Update then
-            pcall(Update.check, Update.json_url, Update.prefix, Update.url)
-        end
-    end)
+    -- Авто-проверка version.json только если enable_autoupdate = true (кнопка в меню — в любой момент)
+    if enable_autoupdate then
+        lua_thread.create(function()
+            wait(2000)
+            if autoupdate_loaded and Update then
+                pcall(Update.check, Update.json_url, Update.prefix, Update.url)
+            end
+        end)
+    end
     
     -- Пакет 220 разбирает lib arizona-events (onArizonaDisplay / onArizonaIncomingCef18). Если библиотека не загрузилась — вручную.
     if not arizona then
