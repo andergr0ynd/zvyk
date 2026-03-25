@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v6.13')
+script_version('v6.15')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -54,8 +54,11 @@ local function loadPendingChangelogIfAny()
     local s = f:read('*a') or ''
     f:close()
     if #s == 0 then return end
-    local ok, dec = pcall(function() return u8:decode(s) end)
-    changelog_after_update = (ok and dec) and dec or s
+    -- mimgui/ImGui ждёт UTF-8 (как imgui.Text в главном окне). u8:decode даёт CP1251 → «????».
+    if #s >= 3 and s:byte(1) == 0xEF and s:byte(2) == 0xBB and s:byte(3) == 0xBF then
+        s = s:sub(4)
+    end
+    changelog_after_update = s
 end
 
 local function pendingChangelogDownloadUsable(path)
@@ -105,7 +108,7 @@ if not decodeJson then
     if ok and j and j.decode then decodeJson = j.decode end
 end
 -- true: один раз после входа в игру проверить version.json (кнопка «Проверить обновления» работает всегда при загруженном блоке Update)
-local enable_autoupdate = false
+local enable_autoupdate = true
 local autoupdate_loaded = false
 local Update = nil
 
@@ -1183,14 +1186,14 @@ end, function()
     imgui.SetNextWindowPos(imgui.ImVec2(w * 0.5, io.DisplaySize.y * 0.5), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
     imgui.SetNextWindowSize(imgui.ImVec2(500, 0), imgui.Cond.FirstUseEver)
     local wf = imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoCollapse
-    if imgui.Begin(u8:decode('ВАЖНО — обновление AutoZatochka'), nil, wf) then
-        imgui.TextColored(imgui.ImVec4(1, 0.35, 0.12, 1), u8:decode('Список изменений'))
+    if imgui.Begin('ВАЖНО — обновление AutoZatochka', nil, wf) then
+        imgui.TextColored(imgui.ImVec4(1, 0.35, 0.12, 1), 'Список изменений')
         imgui.Separator()
         imgui.BeginChild('##changelog_scroll', imgui.ImVec2(460, 240), true)
         imgui.TextWrapped(changelog_after_update)
         imgui.EndChild()
         imgui.Spacing()
-        if imgui.Button(u8:decode('Понятно'), imgui.ImVec2(220, 34)) then
+        if imgui.Button('Понятно', imgui.ImVec2(220, 34)) then
             local pth = pendingChangelogPath()
             if doesFileExist(pth) then
                 pcall(os.remove, pth)
