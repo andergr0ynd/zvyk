@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v6.12')
+script_version('v6.13')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -135,7 +135,7 @@ if decodeJson then
             downloadUrlToFile(json_url, tmp, function(_, status, loaded, total)
                 if status == d.STATUSEX_ENDDOWNLOAD then
                     if doesFileExist(tmp) then
-                        local f = io.open(tmp, 'r')
+                        local f = io.open(tmp, 'rb')
                         if f then
                             local raw = f:read('*a')
                             f:close()
@@ -161,8 +161,9 @@ if decodeJson then
                                             if type(ch) == 'string' and #ch > 0 then
                                                 fallback = ch
                                             else
-                                                fallback = u8:decode('Скрипт обновлён до версии ') .. tostring(l.latest)
-                                                    .. u8:decode('.\n\nСписок изменений: файл changelog.txt в репозитории zvyk (или поле changelog в version.json).')
+                                                -- UTF-8 литералы: в файл пишется UTF-8; u8:decode при чтении (как для changelog с GitHub)
+                                                fallback = 'Скрипт обновлён до версии ' .. tostring(l.latest)
+                                                    .. '.\n\nСписок изменений: файл changelog.txt в репозитории zvyk (или поле changelog в version.json).'
                                             end
                                             lua_thread.create(function()
                                                 wait(350)
