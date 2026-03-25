@@ -1,5 +1,5 @@
 {
-  "latest": "v6.1",
+  "latest": "v7.0",
   "updateurl": "https://raw.githubusercontent.com/.../autozatochka.lua",
   "changelog": "- Новое окно после обновления\n- Исправления CEF\nУбран мусор"
 }
