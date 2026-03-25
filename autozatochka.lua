@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v6.11')
+script_version('v6.12')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
