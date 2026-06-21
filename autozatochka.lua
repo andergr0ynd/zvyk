@@ -1,5 +1,5 @@
 script_name('autozatochka.lua')
-script_version('v6.17')
+script_version('v6.18')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -19,16 +19,140 @@ local status = false
 local max_toch = 0
 local button_id = 0
 
--- Звук при успешной заточке (скачивается с GitHub)
-local SOUND_URL = 'https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/applepay.mp3'
+-- Звук при успешной заточке (скачивается с GitHub / CDN)
+local GITHUB_RAW_BASE = 'https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/'
+local GITHUB_CDN_BASE = 'https://cdn.jsdelivr.net/gh/andergr0ynd/zvyk@main/'
+local RAW_GH_BASE = 'https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/'
+local SOUND_URL = GITHUB_RAW_BASE .. 'applepay.mp3'
 local SOUND_FILENAME = 'applepay.mp3'
 local SOUND_SUBDIR = 'autozatochka'
 local PENDING_CHANGELOG_FILE = 'pending_changelog.txt'
 local success_sound_stream = nil
 
 -- Текст для окна после обновления: сначала качается changelog.txt с GitHub, иначе запасной текст
-local CHANGELOG_TXT_URL = 'https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/changelog.txt'
+local VERSION_JSON_URL = GITHUB_RAW_BASE .. 'version.json'
+local SCRIPT_UPDATE_URL = GITHUB_RAW_BASE .. 'autozatochka.lua'
+local CHANGELOG_TXT_URL = GITHUB_RAW_BASE .. 'changelog.txt'
 local changelog_after_update = ''
+
+local function ensureDirForFile(path)
+    local dir = path:match('^(.*\\)[^\\]+$')
+    if dir and not doesDirectoryExist(dir) then
+        createDirectory(dir)
+    end
+end
+
+local function readFileHead(path, n)
+    local f = io.open(path, 'rb')
+    if not f then return '' end
+    local s = f:read(n or 64) or ''
+    f:close()
+    return s
+end
+
+local function contentLooksLikeHtml(data)
+    if not data or #data == 0 then return true end
+    local head = data:sub(1, 64):lower()
+    return head:find('^<!doctype') ~= nil or head:find('^<html') ~= nil
+end
+
+local function writeBinaryFile(path, data)
+    if not data or #data == 0 then return false end
+    ensureDirForFile(path)
+    local f = io.open(path, 'wb')
+    if not f then return false end
+    f:write(data)
+    f:close()
+    return true
+end
+
+-- MoonLoader downloadUrlToFile + fallback через lib/requests (luasocket)
+local function downloadViaRequests(url, path, timeout_sec)
+    local ok_req, requests = pcall(require, 'requests')
+    if not ok_req or not requests or not requests.get then return false end
+    local bust = url .. (url:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
+    local ok, resp = pcall(requests.get, bust, {
+        timeout = timeout_sec or 30,
+        allow_redirects = true,
+        headers = { ['User-Agent'] = 'MoonLoader-AutoZatochka/6.20' },
+    })
+    if not ok or not resp or not resp.text or #resp.text == 0 then return false end
+    if resp.status_code and resp.status_code >= 400 then return false end
+    if contentLooksLikeHtml(resp.text) then return false end
+    return writeBinaryFile(path, resp.text)
+end
+
+local function downloadViaMoonLoader(url, path, timeout_sec)
+    if type(downloadUrlToFile) ~= 'function' then return false end
+    local ml_ok, ml = pcall(require, 'moonloader')
+    if not ml_ok or not ml or not ml.download_status then return false end
+    local d = ml.download_status
+    local bust = url .. (url:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
+    local done, success = false, false
+    downloadUrlToFile(bust, path, function(_, status)
+        if status == d.STATUSEX_ENDDOWNLOAD or status == d.STATUS_ENDDOWNLOADDATA then
+            done = true
+            success = true
+        end
+    end)
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < (timeout_sec or 45) do wait(50) end
+    if not success or not doesFileExist(path) then return false end
+    wait(200)
+    return not contentLooksLikeHtml(readFileHead(path, 128))
+end
+
+local function downloadToFile(url, path, timeout_sec)
+    ensureDirForFile(path)
+    if doesFileExist(path) then
+        pcall(os.remove, path)
+    end
+    if downloadViaMoonLoader(url, path, timeout_sec) then return true end
+    if doesFileExist(path) then
+        pcall(os.remove, path)
+    end
+    if downloadViaRequests(url, path, timeout_sec) then return true end
+    return false
+end
+
+-- Пробует несколько зеркал (jsDelivr часто доступен, когда github.com заблокирован)
+local function downloadToFileMirrors(urls, path, timeout_sec)
+    for _, url in ipairs(urls) do
+        if downloadToFile(url, path, timeout_sec) then
+            return true, url
+        end
+    end
+    return false, nil
+end
+
+local function mirrorUrlsFor(relative_path)
+    return {
+        GITHUB_CDN_BASE .. relative_path,
+        RAW_GH_BASE .. relative_path,
+        GITHUB_RAW_BASE .. relative_path,
+    }
+end
+
+local function scriptFileLooksLikeLua(path)
+    local fh = io.open(path, 'rb')
+    if not fh then return false end
+    local s = fh:read('*a') or ''
+    fh:close()
+    if #s < 80 then return false end
+    if contentLooksLikeHtml(s) then return false end
+    return s:find('function') ~= nil or s:find('script_name') ~= nil or s:find('require') ~= nil
+end
+
+-- Если в version.json битый updateurl (как .../autozatochka.lua) — берём SCRIPT_UPDATE_URL
+local function resolveScriptUpdateUrl(meta)
+    local url = meta and meta.updateurl
+    if type(url) == 'string' and #url > 12 and url:find('^https?://') and url:find('%.lua') then
+        if not url:find('%.%.%.') then
+            return url
+        end
+    end
+    return SCRIPT_UPDATE_URL
+end
 
 local function pendingChangelogPath()
     return getWorkingDirectory() .. '\\' .. SOUND_SUBDIR .. '\\' .. PENDING_CHANGELOG_FILE
@@ -72,31 +196,16 @@ local function pendingChangelogDownloadUsable(path)
     return true
 end
 
--- Скачивает changelog.txt в pending-файл; если не вышло — пишет fallback (UTF-8)
 local function downloadRemoteChangelogOrWriteFallback(fallback_text)
-    local ml = require('moonloader')
-    local d = ml.download_status
     local dir = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR
     if not doesDirectoryExist(dir) then
         createDirectory(dir)
     end
-    if not d or not downloadUrlToFile then
-        writePendingChangelog(fallback_text)
+    local path = pendingChangelogPath()
+    if downloadToFileMirrors(mirrorUrlsFor('changelog.txt'), path, 22) and pendingChangelogDownloadUsable(path) then
         return
     end
-    local path = pendingChangelogPath()
-    local url = CHANGELOG_TXT_URL .. (CHANGELOG_TXT_URL:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
-    local done = false
-    downloadUrlToFile(url, path, function(_, st)
-        if st == d.STATUSEX_ENDDOWNLOAD or st == d.STATUS_ENDDOWNLOADDATA then
-            done = true
-        end
-    end)
-    local t0 = os.clock()
-    while not done and os.clock() - t0 < 22 do wait(50) end
-    if not pendingChangelogDownloadUsable(path) then
-        writePendingChangelog(fallback_text)
-    end
+    writePendingChangelog(fallback_text)
 end
 
 local as_action = require('moonloader').audiostream_state
@@ -154,104 +263,68 @@ local function remoteIsNewerThanLocal(localVer, remoteVer)
 end
 
 if decodeJson then
-    local d = require('moonloader').download_status
     Update = {
-        json_url = "https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/version.json",
+        json_url = VERSION_JSON_URL,
         prefix = "[AutoZatochka]: ",
         url = "https://github.com/andergr0ynd/zvyk",
         check = function(json_url_base, prefix, url)
             prefix = prefix or ""
             json_url_base = json_url_base or Update.json_url
-            local json_url = json_url_base .. (json_url_base:find("?") and "&" or "?") .. "t=" .. tostring(os.clock())
             local tmp = os.tmpname()
-            if doesFileExist(tmp) then os.remove(tmp) end
-            local start = os.clock()
-            downloadUrlToFile(json_url, tmp, function(_, status, loaded, total)
-                if status == d.STATUSEX_ENDDOWNLOAD then
-                    if doesFileExist(tmp) then
-                        local f = io.open(tmp, 'rb')
-                        if f then
-                            local raw = f:read('*a')
-                            f:close()
-                            os.remove(tmp)
-                            local l = raw and decodeJson(raw)
-                            if l and l.updateurl and l.latest then
-                                local cur = thisScript().version
-                                local remoteNorm = scriptVersionForCompare(l.latest)
-                                if remoteNorm ~= '' and remoteIsNewerThanLocal(cur, l.latest) then
-                                    lua_thread.create(function()
-                                        local m = -1
-                                        sampAddChatMessage(prefix .. u8:decode("Обнаружено обновление. Пытаюсь обновиться c " .. thisScript().version .. " на " .. tostring(l.latest)), m)
-                                        wait(250)
-                                        local goupdatestatus = false
-                                        local scriptPath = thisScript().path
-                                        local function commitScriptUpdateAfterDownload()
-                                            if goupdatestatus then return end
-                                            goupdatestatus = true
-                                            print('Загрузка обновления завершена.')
-                                            sampAddChatMessage(prefix .. u8:decode("Обновление завершено!"), m)
-                                            local ch = l.changelog or l.changes or l.notes
-                                            local fallback
-                                            if type(ch) == 'string' and #ch > 0 then
-                                                fallback = ch
-                                            else
-                                                -- UTF-8 литералы: в файл пишется UTF-8; u8:decode при чтении (как для changelog с GitHub)
-                                                fallback = 'Скрипт обновлён до версии ' .. tostring(l.latest)
-                                                    .. '.\n\nСписок изменений: файл changelog.txt в репозитории zvyk (или поле changelog в version.json).'
-                                            end
-                                            lua_thread.create(function()
-                                                wait(350)
-                                                downloadRemoteChangelogOrWriteFallback(fallback)
-                                                wait(150)
-                                                thisScript():reload()
-                                            end)
-                                        end
-                                        local function scriptFileLooksLikeLua(path)
-                                            local fh = io.open(path, 'rb')
-                                            if not fh then return false end
-                                            local s = fh:read('*a') or ''
-                                            fh:close()
-                                            if #s < 80 then return false end
-                                            local h = s:sub(1, 14):lower()
-                                            if h:find('^<!doctype') or h:find('^<html') then return false end
-                                            return s:find('function') ~= nil or s:find('script_name') ~= nil or s:find('require') ~= nil
-                                        end
-                                        downloadUrlToFile(l.updateurl, scriptPath, function(_, st, p, q)
-                                            if st == d.STATUS_DOWNLOADINGDATA then
-                                                print(string.format('Загружено %d из %d.', p, q))
-                                            elseif st == d.STATUS_ENDDOWNLOADDATA then
-                                                commitScriptUpdateAfterDownload()
-                                            end
-                                            if st == d.STATUSEX_ENDDOWNLOAD then
-                                                if goupdatestatus then
-                                                    return
-                                                end
-                                                -- Часто приходит только STATUSEX_ENDDOWNLOAD без STATUS_ENDDOWNLOADDATA
-                                                if doesFileExist(scriptPath) and scriptFileLooksLikeLua(scriptPath) then
-                                                    commitScriptUpdateAfterDownload()
-                                                else
-                                                    sampAddChatMessage(prefix .. u8:decode("Обновление прошло неудачно. Запускаю устаревшую версию.."), m)
-                                                end
-                                            end
-                                        end)
-                                    end)
-                                else
-                                    print(u8:decode('v' .. thisScript().version .. ': Обновление не требуется.'))
-                                end
-                            else
-                                print(u8:decode('v' .. thisScript().version .. ': Неверный version.json или он отсутствует в репозитории.'))
-                            end
-                        else
-                            os.remove(tmp)
-                            print(u8:decode('v' .. thisScript().version .. ': Не могу прочитать ответ. Проверьте ' .. tostring(url)))
-                        end
+            if doesFileExist(tmp) then pcall(os.remove, tmp) end
+            if not downloadToFileMirrors(mirrorUrlsFor('version.json'), tmp, 25) then
+                print(u8:decode('v' .. thisScript().version .. ': Не удалось скачать version.json. ' .. tostring(json_url_base)))
+                return
+            end
+            local f = io.open(tmp, 'rb')
+            if not f then
+                print(u8:decode('v' .. thisScript().version .. ': Не могу прочитать version.json.'))
+                return
+            end
+            local raw = f:read('*a')
+            f:close()
+            pcall(os.remove, tmp)
+            local l = raw and decodeJson(raw)
+            if not l or not l.latest then
+                print(u8:decode('v' .. thisScript().version .. ': Неверный version.json или он отсутствует в репозитории.'))
+                return
+            end
+            local cur = thisScript().version
+            if scriptVersionForCompare(l.latest) == '' or not remoteIsNewerThanLocal(cur, l.latest) then
+                print(u8:decode('v' .. thisScript().version .. ': Обновление не требуется.'))
+                return
+            end
+            local updateUrl = resolveScriptUpdateUrl(l)
+            lua_thread.create(function()
+                local m = -1
+                sampAddChatMessage(prefix .. u8:decode("Обнаружено обновление. Пытаюсь обновиться c " .. tostring(cur) .. " на " .. tostring(l.latest)), m)
+                wait(250)
+                local scriptPath = thisScript().path
+                local scriptUrls = mirrorUrlsFor('autozatochka.lua')
+                if updateUrl and updateUrl ~= scriptUrls[1] and updateUrl ~= scriptUrls[2] and updateUrl ~= scriptUrls[3] then
+                    table.insert(scriptUrls, 1, updateUrl)
+                end
+                local ok = downloadToFileMirrors(scriptUrls, scriptPath, 60)
+                if ok and scriptFileLooksLikeLua(scriptPath) then
+                    print('Загрузка обновления завершена.')
+                    sampAddChatMessage(prefix .. u8:decode("Обновление завершено!"), m)
+                    local ch = l.changelog or l.changes or l.notes
+                    local fallback
+                    if type(ch) == 'string' and #ch > 0 then
+                        fallback = ch
+                    else
+                        fallback = 'Скрипт обновлён до версии ' .. tostring(l.latest)
+                            .. '.\n\nСписок изменений: changelog.txt в репозитории zvyk.'
                     end
+                    wait(350)
+                    downloadRemoteChangelogOrWriteFallback(fallback)
+                    wait(150)
+                    thisScript():reload()
+                else
+                    sampAddChatMessage(prefix .. u8:decode("Обновление прошло неудачно. Запускаю устаревшую версию.."), m)
+                    print('[AutoZatochka] updateurl: ' .. tostring(updateUrl))
                 end
             end)
-            while os.clock() - start < 10 do wait(100) end
-            if os.clock() - start >= 10 then
-                print(u8:decode('v' .. thisScript().version .. ': timeout проверки обновления. ' .. tostring(url)))
-            end
         end
     }
     autoupdate_loaded = true
@@ -260,7 +333,6 @@ end
 -- Синхронизация lib/arizona-events с GitHub → moonloader\lib\arizona-events
 -- Источник на GitHub: zvyk/arizona-events/*.lua (raw). На диск: moonloader\lib\arizona-events\
 -- Если файлов нет или они битые — скрипт качает, перезагружается, затем продолжает работу.
-local LIB_ARIZONA_EVENTS_BASE = 'https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/heads/main/arizona-events/'
 local LIB_ARIZONA_EVENTS_DIR = 'lib\\arizona-events'
 local LIB_ARIZONA_EVENTS_FILES = { 'init.lua', 'core.lua', 'bitstream.lua', 'subprocess.lua' }
 
@@ -270,9 +342,7 @@ local function libFileLooksBad(path)
     local s = f:read('*a') or ''
     f:close()
     if #s < 32 then return true end
-    local head = s:sub(1, 12):lower()
-    if head:find('^<!doctype') or head:find('^<html') then return true end
-    return false
+    return contentLooksLikeHtml(s)
 end
 
 local function arizonaEventsLibPaths()
@@ -308,35 +378,24 @@ end
 -- возвращает true, если после операции все четыре файла на месте и валидны
 local function syncArizonaEventsLib(force_all)
     ensureArizonaEventsLibDir()
-    local ml = require('moonloader')
-    local d = ml.download_status
-    if not d or not downloadUrlToFile then
-        return false
-    end
     local _, dir = arizonaEventsLibPaths()
+    local all_ok = true
     for _, name in ipairs(LIB_ARIZONA_EVENTS_FILES) do
         local path = dir .. '\\' .. name
         local need = force_all or not doesFileExist(path) or libFileLooksBad(path)
         if need then
-            local url = LIB_ARIZONA_EVENTS_BASE .. name
-            url = url .. (url:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.clock())
-            local done, ok = false, false
-            downloadUrlToFile(url, path, function(_, status)
-                if status == d.STATUSEX_ENDDOWNLOAD or status == d.STATUS_ENDDOWNLOADDATA then
-                    ok = doesFileExist(path) and not libFileLooksBad(path)
-                    done = true
-                end
-            end)
-            local start = os.clock()
-            while not done and os.clock() - start < 45 do wait(50) end
-            if ok then
+            local rel = 'arizona-events/' .. name
+            local ok, usedUrl = downloadToFileMirrors(mirrorUrlsFor(rel), path, 45)
+            if ok and not libFileLooksBad(path) then
                 print('[AutoZatochka] ' .. u8:decode('Библиотека сохранена: ') .. LIB_ARIZONA_EVENTS_DIR .. '\\' .. name)
             else
-                print('[AutoZatochka] ' .. u8:decode('Не удалось скачать: ') .. name)
+                all_ok = false
+                if doesFileExist(path) then pcall(os.remove, path) end
+                print('[AutoZatochka] ' .. u8:decode('Не удалось скачать: ') .. name .. ' (' .. tostring(usedUrl or rel) .. ')')
             end
         end
     end
-    return arizonaEventsLibPresent()
+    return all_ok and arizonaEventsLibPresent()
 end
 
 -- Stone
@@ -349,8 +408,16 @@ local enchantSlotsData = { index = -1, left = -1 }
 -- ID точильного камня: [1187] = "Точильный камень"
 local Whetstone_ITEM_ID = 1187
 
--- Инициализация звука успешной заточки: скачивание с GitHub и загрузка потока
-local dl_status = pcall(require, 'moonloader') and require('moonloader').download_status
+local function soundFileLooksBad(path)
+    if not doesFileExist(path) then return true end
+    local f = io.open(path, 'rb')
+    if not f then return true end
+    local s = f:read('*a') or ''
+    f:close()
+    if #s < 512 then return true end
+    return contentLooksLikeHtml(s)
+end
+
 local function initSuccessSound()
     local dir = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR
     if not doesDirectoryExist(dir) then
@@ -358,37 +425,32 @@ local function initSuccessSound()
     end
     local path = dir .. '\\' .. SOUND_FILENAME
     local function tryLoadStream()
-        if doesFileExist(path) and not success_sound_stream then
+        if doesFileExist(path) and not success_sound_stream and not soundFileLooksBad(path) then
             success_sound_stream = loadAudioStream(path)
         end
     end
-    if doesFileExist(path) then
+    if doesFileExist(path) and not soundFileLooksBad(path) then
         tryLoadStream()
         return
     end
-    if dl_status then
-        downloadUrlToFile(SOUND_URL, path, function(_, status)
-            if status == dl_status.STATUSEX_ENDDOWNLOAD or status == dl_status.STATUS_ENDDOWNLOADDATA then
-                lua_thread.create(function()
-                    wait(200)
-                    tryLoadStream()
-                end)
-            end
-        end)
-    else
-        downloadUrlToFile(SOUND_URL, path)
-        wait(1500)
+    if doesFileExist(path) then pcall(os.remove, path) end
+    if downloadToFileMirrors(mirrorUrlsFor('applepay.mp3'), path, 45) and not soundFileLooksBad(path) then
         tryLoadStream()
+    else
+        if doesFileExist(path) then pcall(os.remove, path) end
+        print('[AutoZatochka] ' .. u8:decode('Не удалось скачать звук (пробовали CDN и GitHub).'))
     end
 end
 
 -- Воспроизведение звука успешной заточки
 local function playSuccessSound()
     if not playSound[0] then return end
+    local path = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR .. '\\' .. SOUND_FILENAME
     if not success_sound_stream then
-        local path = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR .. '\\' .. SOUND_FILENAME
-        if doesFileExist(path) then
+        if doesFileExist(path) and not soundFileLooksBad(path) then
             success_sound_stream = loadAudioStream(path)
+        else
+            lua_thread.create(initSuccessSound)
         end
     end
     if success_sound_stream then
@@ -410,6 +472,10 @@ end
 
 -- == CEF функции == --
 function evalanon(code)
+    if arizona and arizona.eval then
+        arizona.eval(code, 0)
+        return
+    end
     evalcef(("(() => {%s})()"):format(code))
 end
 
@@ -429,11 +495,21 @@ function evalcef(code, encoded)
     raknetDeleteBitStream(bs)
 end
 
+-- Чтение значения из CEF (работает, если arizona.eval возвращает результат)
+local function evalcefReturn(code)
+    if arizona and arizona.eval then
+        local ok, result = pcall(arizona.eval, code, 0)
+        if ok then return result end
+    end
+    evalcef(code, 0)
+    return nil
+end
+
 -- == Функции отправки CEF команд == --
 function sendCEF(str)
     if arizona and arizona.send then
-        arizona.send('onArizonaSend', { text = str, server_id = 0 })
-        return
+        local ok = pcall(arizona.send, 'onArizonaSend', { text = str, server_id = 0 })
+        if ok then return end
     end
     local bs = raknetNewBitStream()
     raknetBitStreamWriteInt8(bs, 220)
@@ -519,7 +595,7 @@ function findStoneSlotNumber()
         } catch(e) { return -1; }
     ]], kwEsc))
     wait(150)
-    local slotNum = evalanon([[ return (typeof window.stoneSlotNumber !== 'undefined' && window.stoneSlotNumber >= 0) ? window.stoneSlotNumber : -1; ]])
+    local slotNum = evalcefReturn('return (typeof window.stoneSlotNumber !== "undefined" && window.stoneSlotNumber >= 0) ? window.stoneSlotNumber : -1;')
     return (type(slotNum) == 'number' and slotNum >= 0) and slotNum or (tonumber(slotNum) or -1)
 end
 
@@ -593,10 +669,8 @@ function findEnchantSlotNumber()
         }
     ]])
     wait(100)
-    local slotNum = evalanon([[
-        return window.enchantSlotNumber !== undefined ? window.enchantSlotNumber : -1;
-    ]])
-    return slotNum or -1
+    local slotNum = evalcefReturn('return window.enchantSlotNumber !== undefined ? window.enchantSlotNumber : -1;')
+    return (type(slotNum) == 'number' and slotNum >= 0) and slotNum or (tonumber(slotNum) or -1)
 end
 
 function findAndClickStone()
@@ -628,7 +702,7 @@ function findAndClickStone()
                 end
             end
             
-            -- Пробуем использовать специальные номера слотов
+            -- Метод 3: специальные номера слотов для слота заточки
             for _, specialSlot in ipairs({-1, -2, -3, 0, 1, 2, 100, 200, 1000, 2000}) do
                 for _, toType in ipairs({1, 2, 3}) do
                     moveItem(stoneSlotNum, 1, specialSlot, toType, 1)
@@ -636,12 +710,10 @@ function findAndClickStone()
                 end
             end
             
-            -- Fallback: Используем rightClickOnBlock для клика по слоту с камнем (type: 1)
-            -- Это "берет" камень в руку
+            -- Fallback: rightClickOnBlock — «взять» камень в руку
             rightClickOnBlock(stoneSlotNum, 1)
-            wait(800) -- Даем больше времени на обработку события
+            wait(800)
             
-            -- Теперь пробуем разместить камень после rightClickOnBlock
             if enchantSlotsData.index >= 0 then
                 for _, toType in ipairs({1, 2, 3, 4, 5}) do
                     moveItem(stoneSlotNum, 1, enchantSlotsData.index, toType, 1)
@@ -655,18 +727,7 @@ function findAndClickStone()
                 end
             end
             
-            -- Метод 3: Пробуем использовать специальные номера слотов для слота заточки
-            -- Возможно, слот заточки имеет специальный номер (не из инвентаря)
-            -- Пробуем отрицательные числа, так как left: -1 может означать специальный номер
-            for _, specialSlot in ipairs({-1, -2, -3, 0, 1, 2, 100, 200, 1000, 2000}) do
-                for _, toType in ipairs({1, 2, 3}) do
-                    moveItem(stoneSlotNum, 1, specialSlot, toType, 1)
-                    wait(200)
-                end
-            end
-            
-            -- Метод 3.5: Пробуем использовать moveItem БЕЗ rightClickOnBlock (может быть, не нужно брать камень в руку?)
-            -- Пропускаем rightClickOnBlock и сразу используем moveItem
+            -- Метод 3.5: moveItem без rightClickOnBlock
             if enchantSlotsData.index >= 0 then
                 moveItem(stoneSlotNum, 1, enchantSlotsData.index, 1, 1)
                 wait(600)
@@ -852,8 +913,13 @@ end
 function findAndClickEnchantButton()
     evalanon([[
         try {
-            const buttonTexts = ['ENCHANT', 'ЗАТОЧКА', 'Заточить', 'Улучшить', 'ENHANCE', 'Заточка', 'заточка', 'ЗАТОЧИТЬ', 'START', 'НАЧАТЬ'];
+            const buttonTexts = ['ENCHANT', 'ЗАТОЧКА', 'Заточить', 'Улучшить', 'ENHANCE', 'Заточка', 'заточка', 'ЗАТОЧИТЬ', 'START', 'НАЧАТЬ', 'ПРОДОЛЖИТЬ', 'УЛУЧШИТЬ'];
             const selectors = [
+                '.enchant-main__button',
+                '.enchant-main__start',
+                '[class*="enchant"][class*="button"]',
+                '[class*="enchant"][class*="start"]',
+                '[class*="workshop"] button',
                 'button',
                 '[role="button"]',
                 '.btn',
@@ -909,16 +975,30 @@ end
 
 -- == Отправка события startEnchant == --
 function startEnchant()
-    -- Отправляем событие startEnchant через CEF (как показано в пакете)
     sendCEF('startEnchant')
-    -- Также пробуем через window.executeEvent
     evalanon([[
         try {
             if (typeof window.executeEvent === 'function') {
                 window.executeEvent('startEnchant', '');
+                window.executeEvent('startEnchant', '[]');
+                window.executeEvent('startEnchant', '{}');
             }
         } catch(e) {}
     ]])
+end
+
+local function triggerEnchantClick()
+    findAndClickEnchantButton()
+    wait(200)
+    startEnchant()
+    if enchantSlotsData.index >= 0 then
+        wait(150)
+        clickOnButton(1, enchantSlotsData.index, 16)
+    end
+    if button_id > 0 then
+        wait(150)
+        sampSendClickTextdraw(button_id)
+    end
 end
 
 -- == Основная логика == --
@@ -930,13 +1010,12 @@ function click_onStone()
 
     if #stone == 0 then
         if workshop_check then
-            -- Пытаемся найти камень через CEF
             findAndClickStone()
-            tochi = workshop_check
         else
             checkWorkshopStatus()
-            workshop_check = true
             findAndClickStone()
+        end
+        if status and max_toch > 0 and workshop_check then
             tochi = true
         end
     else
@@ -948,24 +1027,45 @@ function click_onStone()
     end
 end
 
+-- Разбор updateEnchantSlots: JSON через decodeJson, иначе regex
+local function parseEnchantSlotsPayload(jsonData)
+    if not jsonData or #jsonData == 0 then return end
+    if decodeJson then
+        local ok, parsed = pcall(decodeJson, jsonData)
+        if ok and type(parsed) == 'table' then
+            if parsed.index ~= nil then enchantSlotsData.index = tonumber(parsed.index) end
+            if parsed.left ~= nil then enchantSlotsData.left = tonumber(parsed.left) end
+            return
+        end
+    end
+    local index = jsonData:match('"index":(%d+)') or jsonData:match('"index":(%-?%d+)')
+    local left = jsonData:match('"left":(%d+)') or jsonData:match('"left":(%-?%d+)')
+    if index then enchantSlotsData.index = tonumber(index) end
+    if left then enchantSlotsData.left = tonumber(left) end
+end
+
+local function onEnchantSlotsUpdate(jsonData)
+    if jsonData then
+        parseEnchantSlotsPayload(jsonData)
+        if status and max_toch > 0 then
+            if enchantSlotsData.left == -1 then
+                lua_thread.create(function()
+                    wait(300)
+                    click_onStone()
+                end)
+            else
+                tochi = true
+            end
+        end
+    end
+end
+
 -- Разбор входящих CEF-строк (тип 17 / 18 пакета 220): общая логика для arizona-events и fallback
 local function onCefIncomingText17(str)
     if not str or #str == 0 then return end
     if str:find('updateEnchantSlots') then
         workshop_check = true
-        local jsonData = str:match('updateEnchantSlots|(.+)')
-        if jsonData then
-            local index = jsonData:match('"index":(%d+)') or jsonData:match('"index":(%-?%d+)')
-            local left = jsonData:match('"left":(%d+)') or jsonData:match('"left":(%-?%d+)')
-            if index then enchantSlotsData.index = tonumber(index) end
-            if left then enchantSlotsData.left = tonumber(left) end
-            if enchantSlotsData.left == -1 and status and max_toch > 0 and not tochi then
-                lua_thread.create(function()
-                    wait(300)
-                    click_onStone()
-                end)
-            end
-        end
+        onEnchantSlotsUpdate(str:match('updateEnchantSlots|(.+)'))
     end
 end
 
@@ -973,6 +1073,7 @@ local function onCefIncomingText18(data)
     if not data then return end
     if data:find('updateEnchantSlots') then
         workshop_check = true
+        onEnchantSlotsUpdate(data:match('updateEnchantSlots|(.+)'))
     end
 end
 
@@ -989,7 +1090,7 @@ function main()
             wait(400)
             thisScript():reload()
         else
-            sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Скачивание не удалось. Проверьте сеть и папку zvyk/arizona-events на GitHub.'), -1)
+            sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Скачивание не удалось. Проверьте интернет. Файлы: zvyk/arizona-events на GitHub.'), -1)
         end
         return
     end
@@ -1082,16 +1183,7 @@ function main()
             if (workshop_check and tochi) then
                 wait(1500)
                 stone_check = true
-                -- Пытаемся кликнуть через CEF
-                findAndClickEnchantButton()
-                -- Отправляем событие startEnchant для начала заточки
-                wait(200)
-                startEnchant()
-                -- Fallback на textdraw если есть button_id
-                if button_id > 0 then
-                    wait(200)
-                    sampSendClickTextdraw(button_id)
-                end
+                triggerEnchantClick()
                 tochi = false
                 wait(1500)
                 if stone_check then
@@ -1108,6 +1200,9 @@ function main()
                 wait(1000)
                 if #stone == 0 then
                     findAndClickStone()
+                    if workshop_check then
+                        tochi = true
+                    end
                 else
                     click_onStone()
                 end
@@ -1115,9 +1210,10 @@ function main()
                 -- Периодически проверяем, не открылся ли верстак через CEF
                 wait(2000)
                 checkWorkshopStatus()
-                workshop_check = true
                 wait(500)
-                click_onStone()
+                if workshop_check then
+                    click_onStone()
+                end
             end
         end
     end
@@ -1173,11 +1269,14 @@ imgui.OnFrame(function() return WinState[0] end,
                 all_lost = 0
                 lost_stone_onLVL = 0
                 max_toch = 0
+                status = false
+                tochi = false
                 stone_check = false
+                workshop_check = false
             end
             if imgui.Button('Перезагрузить скрипт', imgui.ImVec2(140, 24)) then
                 lua_thread.create(function()
-                    sampAddChatMessage('[AutoZatochka] Перезагрузка скрипта...', -1)
+                    sampAddChatMessage(u8:decode('[AutoZatochka] Перезагрузка скрипта...'), -1)
                     wait(1000)
                     thisScript():reload()
                 end)
@@ -1185,13 +1284,13 @@ imgui.OnFrame(function() return WinState[0] end,
             if imgui.Button('Проверить обновления', imgui.ImVec2(140, 24)) then
                 lua_thread.create(function()
                     if autoupdate_loaded and Update then
-                        print('[AutoZatochka] Проверка обновлений...', -1)
+                        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Проверка обновлений...'), -1)
                         wait(100)
                         pcall(Update.check, Update.json_url, Update.prefix, Update.url)
                         wait(500)
-                        print('[AutoZatochka] Если есть новая версия — скрипт обновится и перезагрузится.', -1)
+                        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Если есть новая версия — скрипт обновится и перезагрузится.'), -1)
                     else
-                        print('[AutoZatochka] Автообновление недоступно.', -1)
+                        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Автообновление недоступно (нет decodeJson).'), -1)
                     end
                 end)
             end
@@ -1237,7 +1336,6 @@ end)
 
 -- == Проверка и установка флага верстака == --
 function checkWorkshopStatus()
-    -- Простая и надежная проверка через поиск элементов и текста (без wait для использования в imgui)
     evalanon([[
         try {
             const bodyText = (document.body.innerText || document.body.textContent || '').toUpperCase();
@@ -1249,7 +1347,6 @@ function checkWorkshopStatus()
             const hasWorkshopElements = document.querySelectorAll('[class*="workshop"], [class*="Workshop"], [id*="workshop"]').length > 0;
             let hasStoneElements = document.querySelectorAll('[data-item-id="1187"], [data-model="1187"], [data-id="1187"]').length > 0;
             
-            // Проверка через структуру инвентаря (как в sorting.lua)
             if (!hasStoneElements) {
                 const inventoryItems = document.querySelectorAll('.inventory-item-hoc');
                 for (let item of inventoryItems) {
@@ -1275,6 +1372,16 @@ function checkWorkshopStatus()
             window.workshopDetected = false;
         }
     ]])
+    wait(50)
+    -- arizona.eval не возвращает значение из CEF — при активной автозаточке верстак уже открыт
+    if status and max_toch > 0 then
+        workshop_check = true
+        return
+    end
+    local detected = evalcefReturn('return window.workshopDetected === true || window.workshopOpen === true;')
+    if detected == true or detected == 1 or detected == 'true' then
+        workshop_check = true
+    end
 end
 
 -- == Обработка событий == --
@@ -1357,7 +1464,7 @@ function sampev.onServerMessage(color, text)
                 max_toch = 0
                 stone_check = false
                 status = false
-                sampAddChatMessage(u8:decode("У вас заточился предмет до указаной вами заточки, выбери другой предмет или другой уровень"), -1)
+                sampAddChatMessage(u8:decode("У вас заточился предмет до указанной вами заточки, выбери другой предмет или другой уровень"), -1)
             else
                 tochi = true
             end
