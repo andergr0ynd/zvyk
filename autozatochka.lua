@@ -3,7 +3,7 @@
     RPC только копирует строки/числа, клики и звук — в main (как ABarz).
 ]]
 script_name('autozatochka.lua')
-script_version('v1.05')
+script_version('v1.06')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
@@ -41,14 +41,10 @@ local RAW_GH_BASE = 'https://raw.githubusercontent.com/andergr0ynd/zvyk/refs/hea
 local SOUND_URL = GITHUB_RAW_BASE .. 'applepay.mp3'
 local SOUND_FILENAME = 'applepay.mp3'
 local SOUND_SUBDIR = 'autozatochka'
-local PENDING_CHANGELOG_FILE = 'pending_changelog.txt'
 local success_sound_stream = nil
 
--- Текст для окна после обновления: сначала качается changelog.txt с GitHub, иначе запасной текст
 local VERSION_JSON_URL = GITHUB_RAW_BASE .. 'version.json'
 local SCRIPT_UPDATE_URL = GITHUB_RAW_BASE .. 'autozatochka.lua'
-local CHANGELOG_TXT_URL = GITHUB_RAW_BASE .. 'changelog.txt'
-local changelog_after_update = ''
 
 local function ensureDirForFile(path)
     local dir = path:match('^(.*\\)[^\\]+$')
@@ -169,64 +165,10 @@ local function resolveScriptUpdateUrl(meta)
     return SCRIPT_UPDATE_URL
 end
 
-local function pendingChangelogPath()
-    return getWorkingDirectory() .. '\\' .. SOUND_SUBDIR .. '\\' .. PENDING_CHANGELOG_FILE
-end
-
-local function writePendingChangelog(text)
-    local dir = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR
-    if not doesDirectoryExist(dir) then
-        createDirectory(dir)
-    end
-    local f = io.open(pendingChangelogPath(), 'wb')
-    if f then
-        f:write(text or '')
-        f:close()
-    end
-end
-
-local function loadPendingChangelogIfAny()
-    local p = pendingChangelogPath()
-    if not doesFileExist(p) then return end
-    local f = io.open(p, 'rb')
-    if not f then return end
-    local s = f:read('*a') or ''
-    f:close()
-    if #s == 0 then return end
-    -- mimgui/ImGui ждёт UTF-8 (как imgui.Text в главном окне). u8:decode даёт CP1251 → «????».
-    if #s >= 3 and s:byte(1) == 0xEF and s:byte(2) == 0xBB and s:byte(3) == 0xBF then
-        s = s:sub(4)
-    end
-    changelog_after_update = s
-end
-
-local function pendingChangelogDownloadUsable(path)
-    local fh = io.open(path, 'rb')
-    if not fh then return false end
-    local s = fh:read('*a') or ''
-    fh:close()
-    if #s == 0 then return false end
-    local head = s:sub(1, 12):lower()
-    if head:find('^<!doctype') or head:find('^<html') then return false end
-    return true
-end
-
-local function downloadRemoteChangelogOrWriteFallback(fallback_text)
-    local dir = getWorkingDirectory() .. '\\' .. SOUND_SUBDIR
-    if not doesDirectoryExist(dir) then
-        createDirectory(dir)
-    end
-    local path = pendingChangelogPath()
-    if downloadToFileMirrors(mirrorUrlsFor('changelog.txt'), path, 22) and pendingChangelogDownloadUsable(path) then
-        return
-    end
-    writePendingChangelog(fallback_text)
-end
-
 local as_action = require('moonloader').audiostream_state
 
 -- Автообновление скрипта с GitHub (как в Cerberus.lua, с проверкой на nil)
--- version.json: latest, updateurl; опционально changelog — запас, если changelog.txt пустой/недоступен
+-- version.json: latest, updateurl
 if not decodeJson then
     local ok, j = pcall(require, 'json')
     if ok and j and j.decode then decodeJson = j.decode end
@@ -260,8 +202,8 @@ local function queueTd(item)
     incomingTd[#incomingTd + 1] = item
     if #incomingTd > 80 then table.remove(incomingTd, 1) end
 end
--- false: без авто-проверки при входе (нет зацикливания); кнопка «Проверить обновления» всегда вызывает Update.check
-local enable_autoupdate = false
+-- Авто-проверка при входе; кнопка «Проверить обновления» всегда вызывает Update.check
+local enable_autoupdate = true
 local autoupdate_loaded = false
 local Update = nil
 
@@ -311,18 +253,22 @@ if decodeJson then
         json_url = VERSION_JSON_URL,
         prefix = "[AutoZatochka]: ",
         url = "https://github.com/andergr0ynd/zvyk",
-        check = function(json_url_base, prefix, url)
+        check = function(json_url_base, prefix, url, silent)
             prefix = prefix or ""
             json_url_base = json_url_base or Update.json_url
+            local function tell(msg)
+                if silent then return end
+                sampAddChatMessage(prefix .. u8:decode(msg), -1)
+            end
             local tmp = os.tmpname()
             if doesFileExist(tmp) then pcall(os.remove, tmp) end
             if not downloadToFileMirrors(mirrorUrlsFor('version.json'), tmp, 25) then
-                print(u8:decode('v' .. thisScript().version .. ': Не удалось скачать version.json. ' .. tostring(json_url_base)))
+                tell('Не удалось скачать version.json.')
                 return
             end
             local f = io.open(tmp, 'rb')
             if not f then
-                print(u8:decode('v' .. thisScript().version .. ': Не могу прочитать version.json.'))
+                tell('Не могу прочитать version.json.')
                 return
             end
             local raw = f:read('*a')
@@ -330,12 +276,12 @@ if decodeJson then
             pcall(os.remove, tmp)
             local okj, l = safeDecodeJson(raw or '')
             if not okj or type(l) ~= 'table' or not l.latest then
-                print(u8:decode('v' .. thisScript().version .. ': Неверный version.json или он отсутствует в репозитории.'))
+                tell('Неверный version.json или он отсутствует в репозитории.')
                 return
             end
             local cur = thisScript().version
             if scriptVersionForCompare(l.latest) == '' or not remoteIsNewerThanLocal(cur, l.latest) then
-                print(u8:decode('v' .. thisScript().version .. ': Обновление не требуется.'))
+                tell('Установлена актуальная версия ' .. tostring(cur) .. '.')
                 return
             end
             local updateUrl = resolveScriptUpdateUrl(l)
@@ -350,7 +296,6 @@ if decodeJson then
                 end
                 local ok = downloadToFileMirrors(scriptUrls, scriptPath, 60)
                 if ok and scriptFileLooksLikeLua(scriptPath) then
-                    print('Загрузка обновления завершена.')
                     sampAddChatMessage(prefix .. u8:decode("Обновление завершено!"), m)
                     local ch = l.changelog or l.changes or l.notes
                     local fallback
@@ -366,7 +311,6 @@ if decodeJson then
                     thisScript():reload()
                 else
                     sampAddChatMessage(prefix .. u8:decode("Обновление прошло неудачно. Запускаю устаревшую версию.."), m)
-                    print('[AutoZatochka] updateurl: ' .. tostring(updateUrl))
                 end
             end)
         end
@@ -481,7 +425,7 @@ local ws = {
 
 -- Лог верстака: moonloader\config\autozatochka\workshop.log  (команда /mtlog)
 local wz = {
-    enabled = true,
+    enabled = false,
     path = nil,
     n = 0,
     lastState = '',
@@ -576,7 +520,6 @@ function wz.write(tag, msg)
         if not f then return end
         f:write(line)
         f:close()
-        print('[AZ] ' .. line:gsub('\n', ''))
     end)
 end
 function wz.hot(s)
@@ -2083,6 +2026,7 @@ function main()
     sampRegisterChatCommand('mt', function() WinState[0] = not WinState[0] end)
     sampRegisterChatCommand('mtlog', function()
         lua_thread.create(function()
+            wz.enabled = true
             wz.ensure()
             wz.write('CMD', '/mtlog ' .. wz.state())
             wz.lastDump = 0
@@ -2143,7 +2087,7 @@ function main()
         lua_thread.create(function()
             wait(2000)
             if autoupdate_loaded and Update then
-                pcall(Update.check, Update.json_url, Update.prefix, Update.url)
+                pcall(Update.check, Update.json_url, Update.prefix, Update.url, true)
             end
         end)
     end
@@ -2362,9 +2306,7 @@ function ws.drawSettingsBody()
             if autoupdate_loaded and Update then
                 sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Проверка обновлений...'), -1)
                 wait(100)
-                pcall(Update.check, Update.json_url, Update.prefix, Update.url)
-                wait(500)
-                sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Если есть новая версия - скрипт обновится и перезагрузится.'), -1)
+                pcall(Update.check, Update.json_url, Update.prefix, Update.url, false)
             else
                 sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Автообновление недоступно (нет decodeJson).'), -1)
             end
