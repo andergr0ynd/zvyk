@@ -3,7 +3,7 @@
     RPC только копирует строки/числа, клики и звук — в main (как ABarz).
 ]]
 script_name('autozatochka.lua')
-script_version('v1.02')
+script_version('v1.05')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
