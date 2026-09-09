@@ -297,16 +297,6 @@ if decodeJson then
                 local ok = downloadToFileMirrors(scriptUrls, scriptPath, 60)
                 if ok and scriptFileLooksLikeLua(scriptPath) then
                     sampAddChatMessage(prefix .. u8:decode("Обновление завершено!"), m)
-                    local ch = l.changelog or l.changes or l.notes
-                    local fallback
-                    if type(ch) == 'string' and #ch > 0 then
-                        fallback = ch
-                    else
-                        fallback = 'Скрипт обновлён до версии ' .. tostring(l.latest)
-                            .. '.\n\nСписок изменений: changelog.txt в репозитории zvyk.'
-                    end
-                    wait(350)
-                    downloadRemoteChangelogOrWriteFallback(fallback)
                     wait(150)
                     thisScript():reload()
                 else
@@ -2071,7 +2061,6 @@ function main()
         chainArz('onArizonaSend', snapSendPacket)
     end
 
-    loadPendingChangelogIfAny()
     wz.ensure()
     wz.write('BOOT', tostring(thisScript().version) .. ' arizona=' .. tostring(arizona ~= nil) .. ' cefDlg=' .. tostring(cefDlg ~= nil) .. ' file=' .. tostring(wz.path))
     sampAddChatMessage('[AutoZatochka] log: moonloader\\config\\autozatochka\\workshop.log  (/mtlog)', -1)
@@ -2444,33 +2433,6 @@ imgui.OnFrame(function() return WinState[0] end,
         imgui.End()
     end
 )
-
--- Окно списка изменений после обновления
-imgui.OnFrame(function()
-    return changelog_after_update ~= ''
-end, function()
-    local io = imgui.GetIO()
-    local w = io.DisplaySize.x
-    imgui.SetNextWindowPos(imgui.ImVec2(w * 0.5, io.DisplaySize.y * 0.5), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
-    imgui.SetNextWindowSize(imgui.ImVec2(500, 0), imgui.Cond.FirstUseEver)
-    local wf = imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoCollapse
-    if imgui.Begin('ВАЖНО - обновление AutoZatochka', nil, wf) then
-        imgui.TextColored(imgui.ImVec4(1, 0.35, 0.12, 1), 'Список изменений')
-        imgui.Separator()
-        imgui.BeginChild('##changelog_scroll', imgui.ImVec2(460, 240), true)
-        imgui.TextWrapped(changelog_after_update)
-        imgui.EndChild()
-        imgui.Spacing()
-        if imgui.Button('Понятно', imgui.ImVec2(220, 34)) then
-            local pth = pendingChangelogPath()
-            if doesFileExist(pth) then
-                pcall(os.remove, pth)
-            end
-            changelog_after_update = ''
-        end
-        imgui.End()
-    end
-end)
 
 -- == Проверка и установка флага верстака == --
 function checkWorkshopStatus()
