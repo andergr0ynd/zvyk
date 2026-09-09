@@ -1,5 +1,4 @@
 {
-  "latest": "v1.02",
-  "updateurl": "https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/autozatochka.lua",
-  "changelog": "- Добавлены альтернативные ссылки на библиотеки\n- Упрощён код\n -Актуально на июнь"
+  "latest": "v1.05",
+  "updateurl": "https://github.com/andergr0ynd/zvyk/raw/refs/heads/main/autozatochka.lua"
 }
