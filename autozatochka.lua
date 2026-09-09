@@ -413,7 +413,6 @@ local ws = {
     slots511 = {},
 }
 
--- Лог верстака: moonloader\config\autozatochka\workshop.log  (команда /mtlog)
 local wz = {
     enabled = false,
     path = nil,
@@ -2014,23 +2013,6 @@ end
 function main()
     while not isSampAvailable() do wait(100) end
     sampRegisterChatCommand('mt', function() WinState[0] = not WinState[0] end)
-    sampRegisterChatCommand('mtlog', function()
-        lua_thread.create(function()
-            wz.enabled = true
-            wz.ensure()
-            wz.write('CMD', '/mtlog ' .. wz.state())
-            wz.lastDump = 0
-            wz.needDump = true
-            local miss = {}
-            for k, v in pairs(wz.miss) do miss[#miss + 1] = k .. '=' .. tostring(v) end
-            table.sort(miss)
-            if #miss > 0 then
-                wz.write('CEF-OTHER', table.concat(miss, ', '))
-            end
-            sampAddChatMessage('[AutoZatochka] log: ' .. tostring(wz.path), -1)
-            sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Открой верстак и скинь workshop.log'), -1)
-        end)
-    end)
 
     -- У кого нет lib/arizona-events: синхронная докачка → перезагрузка скрипта → уже с require
     if not arizonaEventsLibPresent() then
@@ -2061,9 +2043,7 @@ function main()
         chainArz('onArizonaSend', snapSendPacket)
     end
 
-    wz.ensure()
-    wz.write('BOOT', tostring(thisScript().version) .. ' arizona=' .. tostring(arizona ~= nil) .. ' cefDlg=' .. tostring(cefDlg ~= nil) .. ' file=' .. tostring(wz.path))
-    sampAddChatMessage('[AutoZatochka] log: moonloader\\config\\autozatochka\\workshop.log  (/mtlog)', -1)
+    sampAddChatMessage('[AutoZatochka] ' .. u8:decode('загружен. /mt'), -1)
 
     -- Загрузка звука успешной заточки с GitHub в фоне
     lua_thread.create(function()
