@@ -1,10 +1,25 @@
+--[[
+    Автозаточка Arizona через CEF. Окно как было (/mt).
+    RPC только копирует строки/числа, клики и звук — в main (как ABarz).
+]]
 script_name('autozatochka.lua')
-script_version('v6.18')
+script_version('v6.46')
 script_author('Auto')
 script_description('Автоматическая заточка через CEF интерфейс')
 
-local sampev = require 'lib.samp.events'
-local imgui = require 'mimgui'
+local ok_ev, sampev = pcall(require, 'lib.samp.events')
+if not ok_ev then ok_ev, sampev = pcall(require, 'samp.events') end
+if not ok_ev then sampev = nil end
+local ok_imgui, imgui = pcall(require, 'mimgui')
+if not ok_imgui then
+    function main()
+        while not isSampAvailable() do wait(100) end
+        sampAddChatMessage('[AutoZatochka] Нужен mimgui', -1)
+    end
+    return
+end
+local ok_cef, cefDlg = pcall(require, 'arizona-cef-dialogs')
+if not ok_cef then cefDlg = nil end
 local encoding = require 'encoding'
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
@@ -14,7 +29,7 @@ local new = imgui.new
 local arizona = nil
 
 -- == Settings == --
-local WinState, playSound = new.bool(), new.bool()
+local WinState, playSound, SetWin = new.bool(), new.bool(), new.bool()
 local status = false
 local max_toch = 0
 local button_id = 0
@@ -216,6 +231,35 @@ if not decodeJson then
     local ok, j = pcall(require, 'json')
     if ok and j and j.decode then decodeJson = j.decode end
 end
+
+local function safeDecodeJson(raw)
+    if type(raw) ~= 'string' then return false, nil end
+    local s = raw:gsub('^%s+', ''):gsub('%s+$', '')
+    if s == '' or s == 'null' then return false, nil end
+    local first = s:sub(1, 1)
+    if first ~= '{' and first ~= '[' then return false, nil end
+    if first == '[' and s:match('^%[%s*%]') then return true, {} end
+    local ok, data = pcall(decodeJson, s)
+    if not ok or data == nil then return false, nil end
+    return true, data
+end
+
+local incomingCef, incomingChat, incomingTd = {}, {}, {}
+local function queueCef(str)
+    if type(str) ~= 'string' or str == '' then return end
+    incomingCef[#incomingCef + 1] = str .. ''
+    if #incomingCef > 40 then table.remove(incomingCef, 1) end
+end
+local function queueChat(text)
+    if type(text) ~= 'string' or text == '' then return end
+    incomingChat[#incomingChat + 1] = text .. ''
+    if #incomingChat > 40 then table.remove(incomingChat, 1) end
+end
+local function queueTd(item)
+    if type(item) ~= 'table' then return end
+    incomingTd[#incomingTd + 1] = item
+    if #incomingTd > 80 then table.remove(incomingTd, 1) end
+end
 -- false: без авто-проверки при входе (нет зацикливания); кнопка «Проверить обновления» всегда вызывает Update.check
 local enable_autoupdate = false
 local autoupdate_loaded = false
@@ -284,8 +328,8 @@ if decodeJson then
             local raw = f:read('*a')
             f:close()
             pcall(os.remove, tmp)
-            local l = raw and decodeJson(raw)
-            if not l or not l.latest then
+            local okj, l = safeDecodeJson(raw or '')
+            if not okj or type(l) ~= 'table' or not l.latest then
                 print(u8:decode('v' .. thisScript().version .. ': Неверный version.json или он отсутствует в репозитории.'))
                 return
             end
@@ -403,10 +447,228 @@ local tochi, workshop_check, stone_check = false, false, false
 local lost_stone_onLVL, all_lost = 0, 0
 local stone = {}
 local lost_stone = {}
-local enchantSlotsData = { index = -1, left = -1 }
+local enchantSlotsData = { index = -1, left = -1, right = -1, color = -1 }
+local ws = {
+    chance = -1,
+    cost = -1,
+    available = 0,
+    busy = false,
+    busyAt = 0,
+    pendingResult = nil,
+    stoneSlot = -1,
+    stoneAmount = 0,
+    stoneSlots = {},
+    itemSlot = -1,
+    itemId = -1,
+    itemEnchant = -1,
+    leftNeed = 0,
+    rightNeed = 1,
+    lastPlaceAt = 0,
+    lastPlaceJson = '',
+    tab = 0,
+    gunCtx = false,
+    resSlot = -1,
+    resAmount = 0,
+    leftOn = false,
+    rightOn = false,
+    gAll = 0,
+    gLvl = 0,
+    gRows = {},
+    slots1187 = {},
+    slots10253 = {},
+    slots511 = {},
+}
+
+-- Лог верстака: moonloader\config\autozatochka\workshop.log  (команда /mtlog)
+local wz = {
+    enabled = true,
+    path = nil,
+    n = 0,
+    lastState = '',
+    needDump = false,
+    lastDump = 0,
+    miss = {},
+    outQ = {},
+    needleZ = u8:decode('заточ'),
+    needleW = u8:decode('верстак'),
+    needleS = u8:decode('точил'),
+    jsDump = [[
+        try {
+            var out = [];
+            out.push('href=' + String(location.href || ''));
+            out.push('title=' + String(document.title || ''));
+            var body = (document.body && (document.body.innerText || document.body.textContent) || '');
+            out.push('body=' + String(body).replace(/\s+/g, ' ').slice(0, 500));
+            var nodes = document.querySelectorAll('[class*="enchant"],[class*="Enchant"],[class*="workshop"],[class*="Workshop"],[class*="slot"],button,[role="button"],[class*="inventory"]');
+            out.push('nodes=' + nodes.length);
+            var i, n, shown = 0;
+            for (i = 0; i < nodes.length && shown < 45; i++) {
+                n = nodes[i];
+                var r = n.getBoundingClientRect();
+                if (r.width < 2 && r.height < 2) continue;
+                shown++;
+                out.push('N' + shown + ' tag=' + n.tagName
+                    + ' cls=' + String(n.className || '').toString().slice(0, 90)
+                    + ' id=' + String(n.id || '')
+                    + ' txt=' + String(n.innerText || '').replace(/\s+/g, ' ').slice(0, 70)
+                    + ' wh=' + Math.round(r.width) + 'x' + Math.round(r.height)
+                    + ' slot=' + String(n.getAttribute('data-slot') || n.getAttribute('data-index') || ''));
+            }
+            var imgs = document.querySelectorAll('img');
+            var c1187 = 0;
+            for (i = 0; i < imgs.length; i++) {
+                var a = (imgs[i].getAttribute('alt') || '') + ' ' + (imgs[i].getAttribute('src') || '');
+                if (a.indexOf('1187') === -1) continue;
+                c1187++;
+                var it = imgs[i].closest('[data-slot], .inventory-item-hoc, [class*="item"]');
+                out.push('img1187 alt=' + String(imgs[i].getAttribute('alt') || '')
+                    + ' slot=' + String((it && (it.getAttribute('data-slot') || it.getAttribute('data-index'))) || '?'));
+            }
+            out.push('count1187=' + c1187);
+            out.push('stoneSlot=' + String(window.stoneSlotNumber));
+            out.push('enchantSlot=' + String(window.enchantSlotNumber));
+            out.push('workshopOpen=' + String(window.workshopOpen));
+            out.push('workshopDetected=' + String(window.workshopDetected));
+            window.__azDump = out.join('\n');
+        } catch (e) {
+            window.__azDump = 'err ' + e;
+        }
+    ]],
+}
+function wz.clip(s, n)
+    s = tostring(s or ''):gsub('[\r\n]+', ' | '):gsub('%z', '')
+    n = n or 1000
+    if #s > n then return s:sub(1, n) .. '...[' .. #s .. 'b]' end
+    return s
+end
+function wz.ensure()
+    if wz.path then return end
+    local root = ''
+    pcall(function() root = getWorkingDirectory() or '' end)
+    if root == '' then
+        pcall(function()
+            local p = thisScript().path or ''
+            root = p:match('^(.*\\)') or ''
+        end)
+    end
+    local dir = (root .. '\\config\\autozatochka'):gsub('\\\\+', '\\')
+    if not doesDirectoryExist(dir) then createDirectory(dir) end
+    wz.path = dir .. '\\workshop.log'
+end
+function wz.write(tag, msg)
+    if not wz.enabled then return end
+    pcall(function()
+        wz.ensure()
+        wz.n = (wz.n or 0) + 1
+        if wz.n % 40 == 1 then
+            local fh = io.open(wz.path, 'rb')
+            if fh then
+                local sz = fh:seek('end')
+                fh:close()
+                if sz and sz > 1800000 then
+                    pcall(os.remove, wz.path .. '.old')
+                    pcall(os.rename, wz.path, wz.path .. '.old')
+                end
+            end
+        end
+        local line = os.date('%H:%M:%S') .. ' #' .. wz.n .. ' [' .. tostring(tag) .. '] ' .. wz.clip(msg, 2500) .. '\n'
+        local f = io.open(wz.path, 'a+')
+        if not f then return end
+        f:write(line)
+        f:close()
+        print('[AZ] ' .. line:gsub('\n', ''))
+    end)
+end
+function wz.hot(s)
+    if type(s) ~= 'string' or s == '' then return false end
+    local l = s:lower()
+    if l:find('enchant', 1, true) or l:find('workshop', 1, true) or l:find('1187', 1, true) then return true end
+    if l:find('moveitem', 1, true) or l:find('clickon', 1, true) or l:find('startenchant', 1, true) then return true end
+    if l:find('rightclick', 1, true) or l:find('leftclick', 1, true) then return true end
+    if l:find('startcraft', 1, true) or l:find('resourceNeed', 1, true) then return true end
+    if l:find('updatecategory', 1, true) or l:find('10253', 1, true) or l:find('guncontext', 1, true) then return true end
+    if s:find(wz.needleZ, 1, true) or s:find(wz.needleW, 1, true) or s:find(wz.needleS, 1, true) then return true end
+    return false
+end
+function wz.state()
+    return 'status=' .. tostring(status)
+        .. ' tochi=' .. tostring(tochi)
+        .. ' ws=' .. tostring(workshop_check)
+        .. ' max=' .. tostring(max_toch)
+        .. ' av=' .. tostring(ws.available)
+        .. ' chance=' .. tostring(ws.chance)
+        .. ' busy=' .. tostring(ws.busy)
+        .. ' ench=' .. tostring(ws.itemEnchant)
+        .. ' item=' .. tostring(ws.itemId)
+        .. ' idx=' .. tostring(enchantSlotsData.index)
+        .. ' left=' .. tostring(enchantSlotsData.left)
+        .. ' right=' .. tostring(enchantSlotsData.right)
+        .. ' color=' .. tostring(enchantSlotsData.color)
+        .. ' stoneSlot=' .. tostring(ws.stoneSlot)
+        .. ' stoneN=' .. tostring(ws.stoneAmount)
+        .. ' tab=' .. tostring(ws.tab)
+        .. ' res=' .. tostring(ws.resSlot)
+        .. ' resN=' .. tostring(ws.resAmount)
+        .. ' needL=' .. tostring(ws.leftNeed)
+        .. ' needR=' .. tostring(ws.rightNeed)
+end
+function wz.eventOf(str)
+    local ev, payload = str:match("window%.executeEvent%(%s*'([^']+)'%s*,%s*`([^`]*)`")
+    if ev then return ev, payload end
+    return str:match("window%.executeEvent%(%s*'([^']+)'%s*,%s*'([^']*)'")
+end
+function wz.queueSend(s)
+    if type(s) ~= 'string' or s == '' then return end
+    wz.outQ = wz.outQ or {}
+    wz.outQ[#wz.outQ + 1] = s .. ''
+    if #wz.outQ > 80 then table.remove(wz.outQ, 1) end
+end
+function wz.pumpOut()
+    local q = wz.outQ
+    if not q or #q == 0 then return end
+    wz.outQ = {}
+    for i = 1, #q do
+        local s = q[i]
+        pcall(ws.handleSend, s)
+        if s == wz.lastSendLine then
+            wz.lastSendN = (wz.lastSendN or 1) + 1
+        else
+            if (wz.lastSendN or 0) > 1 then
+                wz.write('SEND', 'repeat x' .. tostring(wz.lastSendN))
+            end
+            wz.write('SEND', s)
+            wz.lastSendLine = s
+            wz.lastSendN = 1
+        end
+    end
+end
+function wz.flushState()
+    local s = wz.state()
+    if s ~= wz.lastState then
+        wz.lastState = s
+        wz.write('STATE', s)
+    end
+end
+function wz.cef(str)
+    if type(str) ~= 'string' or str == '' then return end
+    local cmd = str:match('^([^|]+)') or 'cef'
+    local hot = wz.hot(str)
+    if not hot and not workshop_check and not status then
+        wz.miss[cmd] = (wz.miss[cmd] or 0) + 1
+        return
+    end
+    wz.write('CEF', str)
+end
+function wz.askDump()
+    local now = os.clock()
+    if wz.lastDump and (now - wz.lastDump) < 8 then return end
+    wz.needDump = true
+end
 
 -- ID точильного камня: [1187] = "Точильный камень"
 local Whetstone_ITEM_ID = 1187
+local GUN_STONE_ID = 10253
+local GUN_RES_ID = 511
 
 local function soundFileLooksBad(path)
     if not doesFileExist(path) then return true end
@@ -472,11 +734,12 @@ end
 
 -- == CEF функции == --
 function evalanon(code)
+    code = tostring(code or '')
     if arizona and arizona.eval then
-        arizona.eval(code, 0)
+        pcall(arizona.eval, code, 0)
         return
     end
-    evalcef(("(() => {%s})()"):format(code))
+    evalcef('(() => {' .. code .. '})()')
 end
 
 function evalcef(code, encoded)
@@ -507,6 +770,7 @@ end
 
 -- == Функции отправки CEF команд == --
 function sendCEF(str)
+    wz.write('OUT', str)
     if arizona and arizona.send then
         local ok = pcall(arizona.send, 'onArizonaSend', { text = str, server_id = 0 })
         if ok then return end
@@ -596,7 +860,9 @@ function findStoneSlotNumber()
     ]], kwEsc))
     wait(150)
     local slotNum = evalcefReturn('return (typeof window.stoneSlotNumber !== "undefined" && window.stoneSlotNumber >= 0) ? window.stoneSlotNumber : -1;')
-    return (type(slotNum) == 'number' and slotNum >= 0) and slotNum or (tonumber(slotNum) or -1)
+    local n = (type(slotNum) == 'number' and slotNum >= 0) and slotNum or (tonumber(slotNum) or -1)
+    wz.write('SLOT', 'stone=' .. tostring(n) .. ' raw=' .. tostring(slotNum))
+    return n
 end
 
 function findEnchantSlotNumber()
@@ -670,11 +936,15 @@ function findEnchantSlotNumber()
     ]])
     wait(100)
     local slotNum = evalcefReturn('return window.enchantSlotNumber !== undefined ? window.enchantSlotNumber : -1;')
-    return (type(slotNum) == 'number' and slotNum >= 0) and slotNum or (tonumber(slotNum) or -1)
+    local n = (type(slotNum) == 'number' and slotNum >= 0) and slotNum or (tonumber(slotNum) or -1)
+    wz.write('SLOT', 'enchant=' .. tostring(n) .. ' raw=' .. tostring(slotNum))
+    return n
 end
 
 function findAndClickStone()
+    wz.write('CLICK', 'findAndClickStone ' .. wz.state())
     local stoneSlotNum = findStoneSlotNumber()
+    wz.write('CLICK', 'findAndClickStone stoneSlot=' .. tostring(stoneSlotNum) .. ' left=' .. tostring(enchantSlotsData.left) .. ' idx=' .. tostring(enchantSlotsData.index))
     
     if stoneSlotNum >= 0 then
         if enchantSlotsData.left == -1 then
@@ -682,6 +952,7 @@ function findAndClickStone()
             
             -- 1) Как в ArzMarket: moveItem из слота камня в слот заточки (type 1 = инвентарь)
             if enchantSlot >= 0 then
+                wz.write('CLICK', 'moveItem stone=' .. tostring(stoneSlotNum) .. ' -> enchant=' .. tostring(enchantSlot))
                 moveItem(stoneSlotNum, 1, enchantSlot, 1, 1)
                 wait(500)
             end
@@ -974,119 +1245,865 @@ function findAndClickEnchantButton()
 end
 
 -- == Отправка события startEnchant == --
-function startEnchant()
-    sendCEF('startEnchant')
-    evalanon([[
-        try {
-            if (typeof window.executeEvent === 'function') {
-                window.executeEvent('startEnchant', '');
-                window.executeEvent('startEnchant', '[]');
-                window.executeEvent('startEnchant', '{}');
+function ws.clickEnchantBtn()
+    local code = [[
+        var needles = ['\u0417\u0430\u0442\u043e\u0447\u0438\u0442\u044c', 'ENCHANT'];
+        var nodes = document.querySelectorAll('button, [role="button"], [class*="button"], [class*="btn"], div, span');
+        var i, j;
+        for (i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            var r = n.getBoundingClientRect();
+            if (r.width < 8 || r.height < 8) continue;
+            var t = String(n.innerText || n.textContent || '').replace(/\s+/g, ' ');
+            if (t.length > 80) continue;
+            var hit = false;
+            for (j = 0; j < needles.length; j++) {
+                if (t.indexOf(needles[j]) !== -1) { hit = true; break; }
             }
-        } catch(e) {}
-    ]])
+            if (!hit) continue;
+            if (typeof n.click === 'function') n.click();
+            return t;
+        }
+        return 0;
+    ]]
+    local val = ws.jsQuery(code, 800)
+    wz.write('CLICK', 'enchant-btn ret=' .. tostring(val))
+    return val
+end
+
+function startEnchant()
+    wz.write('CLICK', 'start av=' .. tostring(ws.available) .. ' chance=' .. tostring(ws.chance)
+        .. ' right=' .. tostring(enchantSlotsData.right) .. ' left=' .. tostring(enchantSlotsData.left))
+    if ws.isGun() then
+        if not ws.loopReady() then
+            wz.write('CLICK', 'startEnchant blocked, gun not ready')
+            return
+        end
+        sendCEF('startEnchant')
+        return
+    end
+    local clicked = ws.clickEnchantBtn()
+    sendCEF('startEnchant')
+    if clicked == 0 or clicked == nil or clicked == false then
+        wz.write('CLICK', 'enchant-btn miss, packet sent')
+    end
 end
 
 local function triggerEnchantClick()
-    findAndClickEnchantButton()
-    wait(200)
+    wz.write('CLICK', 'triggerEnchantClick ' .. wz.state())
     startEnchant()
-    if enchantSlotsData.index >= 0 then
-        wait(150)
-        clickOnButton(1, enchantSlotsData.index, 16)
-    end
-    if button_id > 0 then
-        wait(150)
-        sampSendClickTextdraw(button_id)
-    end
 end
 
--- == Основная логика == --
 function click_onStone()
-    -- Сначала проверяем CEF интерфейс, если workshop_check еще не установлен
-    if not workshop_check then
-        checkWorkshopStatus()
-    end
-
-    if #stone == 0 then
-        if workshop_check then
-            findAndClickStone()
-        else
-            checkWorkshopStatus()
-            findAndClickStone()
-        end
-        if status and max_toch > 0 and workshop_check then
-            tochi = true
-        end
-    else
-        for _, v in pairs(stone) do
-            sampSendClickTextdraw(v[1])
-            tochi = (workshop_check and true or false)
-            break
-        end
-    end
+    ws.placeStone()
 end
 
 -- Разбор updateEnchantSlots: JSON через decodeJson, иначе regex
 local function parseEnchantSlotsPayload(jsonData)
     if not jsonData or #jsonData == 0 then return end
-    if decodeJson then
-        local ok, parsed = pcall(decodeJson, jsonData)
-        if ok and type(parsed) == 'table' then
-            if parsed.index ~= nil then enchantSlotsData.index = tonumber(parsed.index) end
-            if parsed.left ~= nil then enchantSlotsData.left = tonumber(parsed.left) end
-            return
-        end
+    local prev = (tostring(enchantSlotsData.index) .. '/' .. tostring(enchantSlotsData.left)
+        .. '/' .. tostring(enchantSlotsData.right) .. '/' .. tostring(enchantSlotsData.color))
+    local ok, parsed = safeDecodeJson(jsonData)
+    if ok and type(parsed) == 'table' then
+        if parsed.index ~= nil then enchantSlotsData.index = tonumber(parsed.index) end
+        if parsed.left ~= nil then enchantSlotsData.left = tonumber(parsed.left) end
+        if parsed.right ~= nil then enchantSlotsData.right = tonumber(parsed.right) end
+        if parsed.color ~= nil then enchantSlotsData.color = tonumber(parsed.color) end
+    else
+        local index = jsonData:match('"index":(%-?%d+)')
+        local left = jsonData:match('"left":(%-?%d+)')
+        local right = jsonData:match('"right":(%-?%d+)')
+        local color = jsonData:match('"color":(%-?%d+)')
+        if index then enchantSlotsData.index = tonumber(index) end
+        if left then enchantSlotsData.left = tonumber(left) end
+        if right then enchantSlotsData.right = tonumber(right) end
+        if color then enchantSlotsData.color = tonumber(color) end
     end
-    local index = jsonData:match('"index":(%d+)') or jsonData:match('"index":(%-?%d+)')
-    local left = jsonData:match('"left":(%d+)') or jsonData:match('"left":(%-?%d+)')
-    if index then enchantSlotsData.index = tonumber(index) end
-    if left then enchantSlotsData.left = tonumber(left) end
+    local now = (tostring(enchantSlotsData.index) .. '/' .. tostring(enchantSlotsData.left)
+        .. '/' .. tostring(enchantSlotsData.right) .. '/' .. tostring(enchantSlotsData.color))
+    if now ~= prev then
+        wz.write('SLOTS', 'idx=' .. tostring(enchantSlotsData.index)
+            .. ' left=' .. tostring(enchantSlotsData.left)
+            .. ' right=' .. tostring(enchantSlotsData.right)
+            .. ' color=' .. tostring(enchantSlotsData.color))
+    end
 end
 
 local function onEnchantSlotsUpdate(jsonData)
     if jsonData then
         parseEnchantSlotsPayload(jsonData)
-        if status and max_toch > 0 then
-            if enchantSlotsData.left == -1 then
-                lua_thread.create(function()
-                    wait(300)
-                    click_onStone()
-                end)
-            else
-                tochi = true
+    end
+end
+
+-- Паттерны чата: заточка только по «с +X на +Y»
+local PATTERN_FAIL       = u8:decode("Увы, вам не удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)")
+local PATTERN_FAIL_U8    = "Увы, вам не удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)"
+local PATTERN_SUCCESS    = u8:decode("Успех! Вам удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)")
+local PATTERN_SUCCESS_U8 = "Успех! Вам удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)"
+local PATTERN_GUN_FAIL   = u8:decode("не удалось улучшить .- до %+([0-9]+)")
+local PATTERN_GUN_FAIL_U8 = "не удалось улучшить .- до %+([0-9]+)"
+local PATTERN_GUN_OK     = u8:decode("успешно улучшили .- до %+([0-9]+)")
+local PATTERN_GUN_OK_U8  = "успешно улучшили .- до %+([0-9]+)"
+
+local function parseEnchantLevelsFromChat(text)
+    local fromLvl, toLvl = text:match(PATTERN_SUCCESS)
+    if not fromLvl then fromLvl, toLvl = text:match(PATTERN_SUCCESS_U8) end
+    if fromLvl and toLvl then
+        return true, tonumber(fromLvl), tonumber(toLvl)
+    end
+    fromLvl, toLvl = text:match(PATTERN_FAIL)
+    if not fromLvl then fromLvl, toLvl = text:match(PATTERN_FAIL_U8) end
+    if fromLvl and toLvl then
+        return false, tonumber(fromLvl), tonumber(toLvl)
+    end
+    toLvl = text:match(PATTERN_GUN_OK) or text:match(PATTERN_GUN_OK_U8)
+    if toLvl then
+        toLvl = tonumber(toLvl)
+        return true, toLvl - 1, toLvl
+    end
+    toLvl = text:match(PATTERN_GUN_FAIL) or text:match(PATTERN_GUN_FAIL_U8)
+    if toLvl then
+        toLvl = tonumber(toLvl)
+        return false, toLvl - 1, toLvl
+    end
+    return nil, nil, nil
+end
+
+function ws.isGun()
+    return tonumber(ws.tab) == 1
+end
+
+function ws.stoneId()
+    if ws.isGun() then return GUN_STONE_ID end
+    return Whetstone_ITEM_ID
+end
+
+function ws.releaseGunMats()
+    if not ws.isGun() then return end
+    ws.leftOn = false
+    ws.rightOn = false
+end
+
+function ws.applyFail()
+    tochi = true
+    ws.pendingResult = nil
+    ws.busy = false
+    ws.releaseGunMats()
+    ws.statFail()
+    wz.write('WS', 'fail ' .. wz.state())
+end
+
+function ws.statFail()
+    local now = os.clock()
+    if (now - (tonumber(ws.statAt) or 0)) < 1.2 then return end
+    ws.statAt = now
+    if ws.isGun() then
+        ws.gAll = (tonumber(ws.gAll) or 0) + 1
+        ws.gLvl = (tonumber(ws.gLvl) or 0) + 1
+    else
+        all_lost = all_lost + 1
+        lost_stone_onLVL = lost_stone_onLVL + 1
+    end
+end
+
+function ws.statOk(toLvl)
+    local now = os.clock()
+    if (now - (tonumber(ws.statAt) or 0)) < 1.2 then return end
+    ws.statAt = now
+    if ws.isGun() then
+        ws.gLvl = (tonumber(ws.gLvl) or 0) + 1
+        ws.gAll = (tonumber(ws.gAll) or 0) + 1
+        ws.gRows = ws.gRows or {}
+        table.insert(ws.gRows, { ws.gLvl, toLvl })
+        ws.gLvl = 0
+    else
+        lost_stone_onLVL = lost_stone_onLVL + 1
+        all_lost = all_lost + 1
+        table.insert(lost_stone, { lost_stone_onLVL, toLvl })
+        lost_stone_onLVL = 0
+    end
+end
+
+function ws.finishSuccess(fromLvl, toLvl)
+    pcall(playSuccessSound)
+    ws.statOk(toLvl)
+    ws.pendingResult = nil
+    ws.busy = false
+    ws.releaseGunMats()
+    local target = tonumber(max_toch) or 0
+    wz.write('WS', 'ok +' .. tostring(fromLvl) .. ' -> +' .. tostring(toLvl) .. ' target=' .. tostring(target))
+    if status and target > 0 and toLvl >= target then
+        tochi = false
+        max_toch = 0
+        stone_check = false
+        status = false
+        sampAddChatMessage(u8:decode("У вас заточился предмет до указанной вами заточки, выбери другой предмет или другой уровень"), -1)
+    elseif status then
+        tochi = true
+    end
+end
+
+function ws.autoOn()
+    return status and (tonumber(max_toch) or 0) > 0
+end
+
+function ws.clearStats()
+    if ws.isGun() then
+        ws.gRows = {}
+        ws.gAll = 0
+        ws.gLvl = 0
+    else
+        lost_stone = {}
+        all_lost = 0
+        lost_stone_onLVL = 0
+    end
+end
+
+function ws.sendCategory()
+    local cat = ws.isGun() and 6 or 0
+    if ws.isGun() and ws.gunCtx then
+        ws.lastCat = cat
+        return
+    end
+    local now = os.clock()
+    if ws.lastCat == cat then
+        return
+    end
+    ws.lastCat = cat
+    ws.lastCatAt = now
+    sendCEF('updateCategory|{"category": ' .. tostring(cat) .. '}')
+    wz.write('CLICK', 'category=' .. tostring(cat))
+end
+
+function ws.setTab(t)
+    t = tonumber(t) or 0
+    if tonumber(ws.tab) == t then return false end
+    ws.tab = t
+    status = false
+    max_toch = 0
+    tochi = false
+    stone_check = false
+    ws.lastCat = nil
+    ws.leftOn = false
+    ws.rightOn = false
+    enchantSlotsData.left = -1
+    enchantSlotsData.right = -1
+    ws.bestStone()
+    ws.bestRes()
+    wz.write('UI', t == 1 and 'tab=weapon' or 'tab=cloth')
+    ws.sendCategory()
+    return true
+end
+
+function ws.slotsJson(idx, left, right, color)
+    return '{"index":' .. tostring(idx) .. ',"left":' .. tostring(left)
+        .. ',"right":' .. tostring(right) .. ',"color":' .. tostring(color) .. '}'
+end
+
+function ws.enoughMats()
+    local needR = tonumber(ws.rightNeed) or 1
+    if needR < 1 then needR = 1 end
+    if (tonumber(ws.stoneAmount) or 0) < needR then return false end
+    if ws.isGun() then
+        local needL = tonumber(ws.leftNeed) or 0
+        if (tonumber(ws.resAmount) or 0) < needL then return false end
+    end
+    return true
+end
+
+function ws.resourcesReady()
+    local stone = tonumber(ws.stoneSlot) or -1
+    local right = tonumber(enchantSlotsData.right) or -1
+    local idx = tonumber(enchantSlotsData.index) or -1
+    if idx < 0 or stone < 0 or right ~= stone then return false end
+    if ws.isGun() then
+        local res = tonumber(ws.resSlot) or -1
+        local left = tonumber(enchantSlotsData.left) or -1
+        if res < 0 or left ~= res then return false end
+    end
+    return ws.enoughMats()
+end
+
+function ws.bestStone()
+    local map = ws.isGun() and (ws.slots10253 or {}) or (ws.slots1187 or {})
+    local bestSlot, bestAmt = -1, -1
+    for slot, amt in pairs(map) do
+        slot = tonumber(slot) or -1
+        amt = tonumber(amt) or 0
+        if slot >= 0 and amt > bestAmt then
+            bestAmt = amt
+            bestSlot = slot
+        end
+    end
+    if bestSlot >= 0 then
+        ws.stoneSlot = bestSlot
+        ws.stoneAmount = bestAmt
+    else
+        ws.stoneSlot = -1
+        ws.stoneAmount = 0
+    end
+    return bestSlot, bestAmt
+end
+
+function ws.bestRes()
+    local bestSlot, bestAmt = -1, -1
+    for slot, amt in pairs(ws.slots511 or {}) do
+        slot = tonumber(slot) or -1
+        amt = tonumber(amt) or 0
+        if slot >= 0 and amt > bestAmt then
+            bestAmt = amt
+            bestSlot = slot
+        end
+    end
+    if bestSlot >= 0 then
+        ws.resSlot = bestSlot
+        ws.resAmount = bestAmt
+    else
+        ws.resSlot = -1
+        ws.resAmount = 0
+    end
+    return bestSlot, bestAmt
+end
+
+function ws.jsQuery(code, timeout)
+    if cefDlg and cefDlg.cefQuery then
+        return cefDlg.cefQuery(code, timeout or 800)
+    end
+    evalanon(code)
+    return nil
+end
+
+function ws.clickInvSlot(slot, needle, tag)
+    slot = tonumber(slot) or -1
+    if slot < 0 then return nil end
+    needle = tostring(needle or '')
+    local code = 'var want=' .. tostring(slot) .. '; var needle="' .. needle .. '";' ..
+        [[
+        function fire(el) {
+            if (!el) return 0;
+            var t = el;
+            if (el.tagName === 'IMG') t = el.closest('[data-slot], .inventory-item-hoc, button, [role="button"]') || el;
+            var opts = { bubbles: true, cancelable: true, view: window };
+            t.dispatchEvent(new MouseEvent('pointerdown', opts));
+            t.dispatchEvent(new MouseEvent('mousedown', opts));
+            t.dispatchEvent(new MouseEvent('pointerup', opts));
+            t.dispatchEvent(new MouseEvent('mouseup', opts));
+            t.dispatchEvent(new MouseEvent('click', opts));
+            if (typeof t.click === 'function') t.click();
+            return 1;
+        }
+        var el = null;
+        var all = document.querySelectorAll('.inventory-item-hoc, [data-slot], [data-index]');
+        var i;
+        for (i = 0; i < all.length; i++) {
+            var n = all[i];
+            var s = n.getAttribute('data-slot') || n.getAttribute('data-index') || '';
+            if (String(s) === String(want)) { el = n; break; }
+        }
+        if (!el && needle) {
+            var imgs = document.querySelectorAll('img');
+            for (i = 0; i < imgs.length; i++) {
+                var a = (imgs[i].getAttribute('alt') || '') + ' ' + (imgs[i].getAttribute('src') || '');
+                if (a.indexOf(needle) !== -1) {
+                    el = imgs[i].closest('.inventory-item-hoc, [data-slot]') || imgs[i];
+                    break;
+                }
+            }
+        }
+        return fire(el);
+        ]]
+    local val = ws.jsQuery(code, 700)
+    wz.write('CLICK', 'cefQuery ' .. tostring(tag or 'slot') .. '=' .. tostring(slot) .. ' ret=' .. tostring(val))
+    return val
+end
+
+function ws.clickStoneJs()
+    return ws.clickInvSlot(ws.stoneSlot, '1187', 'stone')
+end
+
+function ws.loopReady()
+    if ws.isGun() then
+        if not ws.resourcesReady() then return false end
+        if (tonumber(ws.available) or 0) ~= 1 then return false end
+        if (os.clock() - (tonumber(ws.lastPlaceAt) or 0)) < 0.4 then return false end
+        return true
+    end
+    return (tonumber(ws.available) or 0) == 1 or ws.resourcesReady()
+end
+
+function ws.placeStone()
+    ws.bestStone()
+    ws.bestRes()
+    local idx = tonumber(enchantSlotsData.index) or -1
+    local stone = tonumber(ws.stoneSlot) or -1
+    local gun = ws.isGun()
+    if idx < 0 then
+        if ws.loopTag ~= 'wait-item' then
+            wz.write('CLICK', gun and 'wait weapon on bench' or 'wait item on bench (click the item first)')
+        end
+        return false
+    end
+    if stone < 0 or (tonumber(ws.stoneAmount) or 0) <= 0 then
+        if ws.loopTag ~= 'no-stone' then
+            wz.write('CLICK', gun and 'no gun stone 10253' or 'no whetstone 1187 in inventory')
+        end
+        return false
+    end
+    if gun then
+        local res = tonumber(ws.resSlot) or -1
+        if res < 0 or (tonumber(ws.resAmount) or 0) <= 0 then
+            if ws.loopTag ~= 'no-res' then
+                wz.write('CLICK', 'no gun resource 511')
             end
+            return false
+        end
+        if not ws.enoughMats() then
+            if not ws.lowMatSaid then
+                ws.lowMatSaid = true
+                wz.write('CLICK', 'not enough mats stoneN=' .. tostring(ws.stoneAmount)
+                    .. ' needR=' .. tostring(ws.rightNeed)
+                    .. ' resN=' .. tostring(ws.resAmount)
+                    .. ' needL=' .. tostring(ws.leftNeed))
+                sampAddChatMessage(u8:decode('Не хватает заточки на оружие или ресурса'), 0xFF3333)
+            end
+            return false
+        end
+        ws.lowMatSaid = false
+    end
+    if ws.resourcesReady() then
+        return true
+    end
+    local now = os.clock()
+    local gap = gun and 1.0 or 2.5
+    if (now - (tonumber(ws.lastPlaceAt) or 0)) < gap then
+        return false
+    end
+    ws.lastPlaceAt = now
+    local left = tonumber(enchantSlotsData.left) or -1
+    local right = tonumber(enchantSlotsData.right) or -1
+    if gun then
+        local res = tonumber(ws.resSlot) or -1
+        if left ~= res then
+            ws.clickInvSlot(res, '511', 'gun-res')
+            wz.write('CLICK', 'gun click res slot=' .. tostring(res))
+            return false
+        end
+        if right ~= stone then
+            ws.clickInvSlot(stone, '10253', 'gun-stone')
+            wz.write('CLICK', 'gun click stone slot=' .. tostring(stone) .. ' keepLeft=' .. tostring(res))
+            return false
+        end
+        return ws.resourcesReady()
+    end
+    if right ~= stone then
+        ws.clickStoneJs()
+    end
+    local json = ws.slotsJson(idx, left, stone, -1)
+    sendCEF('updateEnchantSlots|' .. json)
+    wz.write('CLICK', 'place updateEnchantSlots|' .. json
+        .. ' stoneN=' .. tostring(ws.stoneAmount))
+    return idx >= 0
+end
+
+function ws.handleSend(text)
+    if type(text) ~= 'string' or text == '' then return end
+    if text:sub(1, 8) == 'REWRITE ' then return end
+    local json = text:match('^updateEnchantSlots|(.+)')
+    if not json then return end
+    parseEnchantSlotsPayload(json)
+    if not ws.autoOn() then return end
+    if ws.isGun() then return end
+    local stone = tonumber(ws.stoneSlot) or -1
+    if stone >= 0 and (tonumber(enchantSlotsData.right) or -1) == -1 then
+        enchantSlotsData.right = stone
+    end
+end
+
+function ws.ingestItems(items, invType)
+    if type(items) ~= 'table' then return end
+    invType = tonumber(invType) or 1
+    if invType ~= 1 then return end
+    ws.slots1187 = ws.slots1187 or {}
+    ws.slots10253 = ws.slots10253 or {}
+    ws.slots511 = ws.slots511 or {}
+    local targetSlot = tonumber(enchantSlotsData.index) or -1
+    for _, item in ipairs(items) do
+        if type(item) == 'table' then
+            local id = tonumber(item.item)
+            local slot = tonumber(item.slot)
+            if slot then
+                if id == Whetstone_ITEM_ID then
+                    ws.slots1187[slot] = tonumber(item.amount) or ws.slots1187[slot] or 1
+                    ws.slots10253[slot] = nil
+                    ws.slots511[slot] = nil
+                elseif id == GUN_STONE_ID then
+                    ws.slots10253[slot] = tonumber(item.amount) or ws.slots10253[slot] or 1
+                    ws.slots1187[slot] = nil
+                    ws.slots511[slot] = nil
+                elseif id == GUN_RES_ID then
+                    ws.slots511[slot] = tonumber(item.amount) or ws.slots511[slot] or 1
+                    ws.slots1187[slot] = nil
+                    ws.slots10253[slot] = nil
+                else
+                    ws.slots1187[slot] = nil
+                    ws.slots10253[slot] = nil
+                    ws.slots511[slot] = nil
+                end
+            end
+            local ench = item.enchant
+            local txtLvl = tostring(item.text or ''):match('%+(%d+)')
+            local isTarget = (targetSlot >= 0 and slot == targetSlot)
+            if isTarget then
+                local newLvl = tonumber(txtLvl) or tonumber(ench)
+                if id and id ~= Whetstone_ITEM_ID and id ~= GUN_STONE_ID and id ~= GUN_RES_ID then
+                    ws.itemSlot = slot or ws.itemSlot
+                    ws.itemId = id
+                    local prev = tonumber(ws.itemEnchant) or -1
+                    if newLvl ~= nil then
+                        ws.itemEnchant = newLvl
+                        if ws.pendingResult == 1 and newLvl ~= prev then
+                            ws.finishSuccess(prev >= 0 and prev or (newLvl - 1), newLvl)
+                        elseif status and (tonumber(max_toch) or 0) > 0 and newLvl >= (tonumber(max_toch) or 0) then
+                            ws.finishSuccess(prev >= 0 and prev or (newLvl - 1), newLvl)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    ws.bestStone()
+    ws.bestRes()
+end
+
+function ws.handle(ev, payload)
+    if not ev then return end
+    payload = payload or ''
+    if ev == 'event.inventory.setWorkshopVisible' then
+        local on = payload:find('true', 1, true) ~= nil
+        workshop_check = on
+        if on then
+            wz.write('WS', 'visible')
+        else
+            wz.write('WS', 'hidden')
+            ws.busy = false
+            enchantSlotsData.index = -1
+            enchantSlotsData.left = -1
+            enchantSlotsData.right = -1
+            enchantSlotsData.color = -1
+            ws.available = 0
+            ws.lastPlaceJson = ''
+            ws.lastCat = nil
+            ws.leftOn = false
+            ws.rightOn = false
+        end
+        return
+    end
+    if ev == 'event.inventory.setWorkshopGunContext' then
+        local on = payload:find('true', 1, true) ~= nil
+        ws.gunCtx = on and true or false
+        wz.write('WS', 'gunCtx=' .. tostring(ws.gunCtx))
+        if on then
+            ws.lastCat = 6
+            if not ws.autoOn() then ws.tab = 1 end
+        else
+            if not ws.autoOn() then ws.tab = 0 end
+        end
+        return
+    end
+    if ev == 'event.workshop.setResourceNeedItems' then
+        workshop_check = true
+        local ok, arr = safeDecodeJson(payload)
+        if ok and type(arr) == 'table' then
+            local row = arr[1] or arr
+            if type(row) == 'table' then
+                if row.leftResourceAmount ~= nil then ws.leftNeed = tonumber(row.leftResourceAmount) or 0 end
+                if row.rightResourceAmount ~= nil then ws.rightNeed = tonumber(row.rightResourceAmount) or 1 end
+            end
+        end
+        wz.write('WS', 'need left=' .. tostring(ws.leftNeed) .. ' right=' .. tostring(ws.rightNeed))
+        return
+    end
+    if ev == 'event.notify.initialize' then
+        local msg = tostring(payload or '')
+        wz.write('NOTIFY', wz.clip(msg, 180))
+        if ws.isGun() then
+            if msg:find('Заточка на оружие', 1, true) or msg:find(u8:decode('Заточка на оружие'), 1, true) then
+                ws.busy = false
+                wz.write('WS', 'gun: not enough 10253')
+            end
+        end
+        return
+    end
+    if ev == 'event.inventory.workShop' then
+        workshop_check = true
+        local ok, arr = safeDecodeJson(payload)
+        if not ok or type(arr) ~= 'table' then
+            wz.write('WS', 'workshop-json-fail ' .. wz.clip(payload, 200))
+            return
+        end
+        local row = arr[1]
+        if type(row) ~= 'table' then row = arr end
+        if type(row) ~= 'table' then return end
+        local action = tonumber(row.action)
+        local data = row.data or {}
+        if action == 2 then
+            if data.chance ~= nil then ws.chance = tonumber(data.chance) or ws.chance end
+            if data.cost ~= nil then ws.cost = tonumber(data.cost) or ws.cost end
+            if data.available ~= nil then ws.available = tonumber(data.available) or ws.available end
+            if data.amount ~= nil then ws.amount = tonumber(data.amount) or ws.amount end
+            wz.write('WS', 'ready chance=' .. tostring(ws.chance) .. ' cost=' .. tostring(ws.cost) .. ' av=' .. tostring(ws.available))
+        elseif action == 0 then
+            ws.busy = true
+            ws.busyAt = os.clock()
+            wz.write('WS', 'started ' .. tostring(data.time))
+        elseif action == 1 then
+            ws.busy = false
+            local suc = tonumber(data.success)
+            wz.write('WS', 'result success=' .. tostring(suc) .. ' ench=' .. tostring(ws.itemEnchant))
+            if suc == 1 then
+                ws.pendingResult = 1
+            else
+                ws.applyFail()
+            end
+        end
+        return
+    end
+    if ev == 'event.inventory.playerInventory' then
+        local ok, arr = safeDecodeJson(payload)
+        if not ok or type(arr) ~= 'table' then return end
+        local row = arr[1]
+        if type(row) ~= 'table' then return end
+        local data = row.data or {}
+        if type(data.items) == 'table' then
+            ws.ingestItems(data.items, data.type)
         end
     end
 end
 
--- Разбор входящих CEF-строк (тип 17 / 18 пакета 220): общая логика для arizona-events и fallback
-local function onCefIncomingText17(str)
-    if not str or #str == 0 then return end
-    if str:find('updateEnchantSlots') then
+local function processCefText(str)
+    if type(str) ~= 'string' or str == '' then return end
+    wz.cef(str)
+    local ev, payload
+    if arizona and arizona.decode then
+        local pkt = { id = 17, text = str }
+        local okd, decoded = pcall(arizona.decode, pkt)
+        if okd and decoded and pkt.event then
+            ev = pkt.event
+            if type(pkt.json) == 'string' then
+                payload = pkt.json
+            elseif encodeJson then
+                local oke, js = pcall(encodeJson, pkt.json)
+                if oke then payload = js end
+            end
+        end
+    end
+    if not ev then
+        ev, payload = wz.eventOf(str)
+    end
+    if ev then
+        pcall(ws.handle, ev, payload or '')
+    end
+    if str:find('updateEnchantSlots', 1, true) then
         workshop_check = true
         onEnchantSlotsUpdate(str:match('updateEnchantSlots|(.+)'))
     end
 end
 
-local function onCefIncomingText18(data)
-    if not data then return end
-    if data:find('updateEnchantSlots') then
-        workshop_check = true
-        onEnchantSlotsUpdate(data:match('updateEnchantSlots|(.+)'))
+local function processChatLine(text)
+    if type(text) ~= 'string' or text == '' then return end
+    if (tonumber(max_toch) or 0) <= 0 then return end
+    local t = text:gsub("%{%x%x%x%x%x%x%}", "")
+    local isSuccess, fromLvl, toLvl = parseEnchantLevelsFromChat(t)
+    if isSuccess == nil then
+        if wz.hot(t) then wz.write('CHAT', t) end
+        return
     end
+    wz.write('CHAT', (isSuccess and 'OK' or 'FAIL') .. ' +' .. tostring(fromLvl) .. ' -> +' .. tostring(toLvl) .. ' | ' .. t)
+    if not isSuccess then
+        tochi = true
+        ws.busy = false
+        ws.pendingResult = nil
+        ws.releaseGunMats()
+        ws.statFail()
+        return
+    end
+    if isSuccess and toLvl then
+        pcall(playSuccessSound)
+        ws.statOk(toLvl)
+        ws.busy = false
+        ws.pendingResult = nil
+        ws.releaseGunMats()
+        local target = tonumber(max_toch) or 0
+        if toLvl == target and fromLvl == (target - 1) then
+            tochi = false
+            max_toch = 0
+            stone_check = false
+            status = false
+            sampAddChatMessage(u8:decode("У вас заточился предмет до указанной вами заточки, выбери другой предмет или другой уровень"), -1)
+        else
+            tochi = true
+        end
+    end
+end
+
+local function processTd(d)
+    if type(d) ~= 'table' then return end
+    local text = d.text or ''
+    local interesting = wz.hot(text) or d.modelId == Whetstone_ITEM_ID
+        or (d.letterColor == -10398017 and d.lineWidth == 44)
+        or text:find('WORKSHOP', 1, true) or text:find('ENCHANT', 1, true)
+        or text:find('МАСТЕРСКАЯ', 1, true) or text:find('Мастерская', 1, true)
+        or text:find('ВЕРСТАК', 1, true) or text:find('Верстак', 1, true) or text:find('верстак', 1, true)
+        or text:find('ЗАТОЧКА', 1, true) or text:find('Заточка', 1, true)
+    if interesting then
+        wz.write('TD', 'id=' .. tostring(d.id)
+            .. ' text=' .. wz.clip(text, 180)
+            .. ' color=' .. tostring(d.letterColor)
+            .. ' w=' .. tostring(d.lineWidth)
+            .. ' h=' .. tostring(d.lineHeight)
+            .. ' model=' .. tostring(d.modelId)
+            .. ' sel=' .. tostring(d.selectable))
+    end
+    if text:find('WORKSHOP', 1, true) or text:find('МАСТЕРСКАЯ', 1, true) or text:find('Мастерская', 1, true)
+        or text:find('ВЕРСТАК', 1, true) or text:find('Верстак', 1, true) or text:find('верстак', 1, true) then
+        stone = {}
+        workshop_check = true
+        wz.askDump()
+    end
+    if text:find('ENCHANT', 1, true) or text:find('ЗАТОЧКА', 1, true) or text:find('Заточка', 1, true) then
+        local id = tonumber(d.id) or 0
+        button_id = id - 1
+    end
+    if d.letterColor == -10398017 and d.lineWidth == 44 and d.lineHeight == 16 then
+        button_id = tonumber(d.id) or button_id
+    end
+    if workshop_check then
+        if stone_check and (tonumber(d.lineWidth) or 0) >= 1 then
+            stone_check = false
+        end
+        if d.modelId == Whetstone_ITEM_ID and d.selectable == 1 then
+            table.insert(stone, { tonumber(d.id) })
+        end
+    end
+end
+
+local function pumpIncoming()
+    wz.pumpOut()
+    if #incomingCef > 0 then
+        local batch = incomingCef
+        incomingCef = {}
+        for i = 1, #batch do pcall(processCefText, batch[i]) end
+    end
+    if #incomingChat > 0 then
+        local batch = incomingChat
+        incomingChat = {}
+        for i = 1, #batch do pcall(processChatLine, batch[i]) end
+    end
+    if #incomingTd > 0 then
+        local batch = incomingTd
+        incomingTd = {}
+        for i = 1, #batch do pcall(processTd, batch[i]) end
+    end
+end
+
+local function chainArz(name, fn)
+    if not arizona then return end
+    local prev = arizona[name]
+    arizona[name] = function(packet)
+        local ok1, r1 = pcall(fn, packet)
+        local r2
+        if prev then
+            local ok2, x = pcall(prev, packet)
+            if ok2 then r2 = x end
+        end
+        if ok1 and r1 == false then return false end
+        if ok1 and type(r1) == 'table' then return r1 end
+        return r2
+    end
+end
+
+local function snapCefPacket(packet)
+    if not packet then return end
+    pcall(function()
+        local t = packet.text
+        if type(t) == 'string' and t ~= '' then queueCef(t) end
+    end)
+end
+
+local function snapSendPacket(packet)
+    if not packet or type(packet.text) ~= 'string' or packet.text == '' then return end
+    local t = packet.text
+    wz.queueSend(t)
+    if not ws.autoOn() then return end
+    if ws.isGun() then return end
+    local json = t:match('^updateEnchantSlots|(.+)')
+    if not json then return end
+    pcall(ws.bestStone)
+    pcall(ws.bestRes)
+    local stone = tonumber(ws.stoneSlot) or -1
+    local res = tonumber(ws.resSlot) or -1
+    local idx = tonumber(json:match('"index":(%-?%d+)')) or tonumber(enchantSlotsData.index) or -1
+    local left = tonumber(json:match('"left":(%-?%d+)')) or tonumber(enchantSlotsData.left) or -1
+    local right = tonumber(json:match('"right":(%-?%d+)')) or -1
+    local color = tonumber(json:match('"color":(%-?%d+)')) or -1
+    if idx < 0 then return end
+    local need = false
+    if ws.isGun() then
+        if not (ws.leftOn and ws.rightOn and res >= 0 and stone >= 0) then return end
+        if left ~= res then
+            left = res
+            need = true
+        end
+        if right ~= stone then
+            right = stone
+            need = true
+        end
+    else
+        if stone >= 0 and right ~= stone then
+            right = stone
+            need = true
+        end
+    end
+    if color ~= -1 then
+        color = -1
+        need = true
+    end
+    if not need then return end
+    packet.text = 'updateEnchantSlots|' .. ws.slotsJson(idx, left, right, color)
+    local now = os.clock()
+    if not ws.lastRewriteLog or (now - ws.lastRewriteLog) > 1 then
+        ws.lastRewriteLog = now
+        wz.queueSend('REWRITE ' .. packet.text)
+    end
+    return { packet }
 end
 
 function main()
     while not isSampAvailable() do wait(100) end
     sampRegisterChatCommand('mt', function() WinState[0] = not WinState[0] end)
+    sampRegisterChatCommand('mtlog', function()
+        lua_thread.create(function()
+            wz.ensure()
+            wz.write('CMD', '/mtlog ' .. wz.state())
+            wz.lastDump = 0
+            wz.needDump = true
+            local miss = {}
+            for k, v in pairs(wz.miss) do miss[#miss + 1] = k .. '=' .. tostring(v) end
+            table.sort(miss)
+            if #miss > 0 then
+                wz.write('CEF-OTHER', table.concat(miss, ', '))
+            end
+            sampAddChatMessage('[AutoZatochka] log: ' .. tostring(wz.path), -1)
+            sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Открой верстак и скинь workshop.log'), -1)
+        end)
+    end)
 
     -- У кого нет lib/arizona-events: синхронная докачка → перезагрузка скрипта → уже с require
     if not arizonaEventsLibPresent() then
-        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Не найдены библиотеки arizona-events. Скачиваю с GitHub…'), -1)
+        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Не найдены библиотеки arizona-events. Скачиваю с GitHub...'), -1)
         local ok = syncArizonaEventsLib(true)
         if ok then
-            sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Загрузка завершена. Перезапуск скрипта…'), -1)
+            sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Загрузка завершена. Перезапуск скрипта...'), -1)
             wait(400)
             thisScript():reload()
         else
@@ -1105,19 +2122,15 @@ function main()
     end
 
     if arizona then
-        arizona.onArizonaDisplay = function(packet)
-            if packet and packet.text then
-                onCefIncomingText17(packet.text)
-            end
-        end
-        arizona.onArizonaIncomingCef18 = function(packet)
-            if packet and packet.text then
-                onCefIncomingText18(packet.text)
-            end
-        end
+        chainArz('onArizonaDisplay', snapCefPacket)
+        chainArz('onArizonaIncomingCef18', snapCefPacket)
+        chainArz('onArizonaSend', snapSendPacket)
     end
 
     loadPendingChangelogIfAny()
+    wz.ensure()
+    wz.write('BOOT', tostring(thisScript().version) .. ' arizona=' .. tostring(arizona ~= nil) .. ' cefDlg=' .. tostring(cefDlg ~= nil) .. ' file=' .. tostring(wz.path))
+    sampAddChatMessage('[AutoZatochka] log: moonloader\\config\\autozatochka\\workshop.log  (/mtlog)', -1)
 
     -- Загрузка звука успешной заточки с GitHub в фоне
     lua_thread.create(function()
@@ -1137,26 +2150,36 @@ function main()
     
     -- Пакет 220 разбирает lib arizona-events (onArizonaDisplay / onArizonaIncomingCef18). Если библиотека не загрузилась — вручную.
     if not arizona then
-        addEventHandler('onReceivePacket', function(id, bs)
-            if id ~= 220 then return end
-            raknetBitStreamIgnoreBits(bs, 8)
-            local packetType = raknetBitStreamReadInt8(bs)
-            if packetType == 17 then
-                raknetBitStreamIgnoreBits(bs, 32)
-                local length = raknetBitStreamReadInt16(bs)
-                local encoded = raknetBitStreamReadInt8(bs)
-                if length > 0 then
-                    local str = (encoded ~= 0) and raknetBitStreamDecodeString(bs, length + encoded) or raknetBitStreamReadString(bs, length)
-                    if str then onCefIncomingText17(str) end
-                end
-            elseif packetType == 18 then
-                local dataLength = raknetBitStreamReadInt16(bs)
-                local encoded = raknetBitStreamReadInt8(bs)
-                if dataLength > 0 then
-                    local data = (encoded ~= 0) and raknetBitStreamDecodeString(bs, dataLength + encoded) or raknetBitStreamReadString(bs, dataLength)
-                    if data then onCefIncomingText18(data) end
-                end
-            end
+        pcall(function()
+            addEventHandler('onReceivePacket', function(id, bs)
+                if id ~= 220 then return end
+                local act
+                pcall(function()
+                    local off
+                    if raknetBitStreamGetReadOffset then off = raknetBitStreamGetReadOffset(bs) end
+                    if raknetBitStreamSetReadOffset then raknetBitStreamSetReadOffset(bs, 0) end
+                    raknetBitStreamIgnoreBits(bs, 8)
+                    local packetType = raknetBitStreamReadInt8(bs)
+                    if packetType == 17 then
+                        raknetBitStreamIgnoreBits(bs, 32)
+                        local length = raknetBitStreamReadInt16(bs)
+                        local encoded = raknetBitStreamReadInt8(bs)
+                        if length and length > 0 then
+                            local str = (encoded ~= 0) and raknetBitStreamDecodeString(bs, length + encoded) or raknetBitStreamReadString(bs, length)
+                            if type(str) == 'string' then act = str end
+                        end
+                    elseif packetType == 18 then
+                        local dataLength = raknetBitStreamReadInt16(bs)
+                        local encoded = raknetBitStreamReadInt8(bs)
+                        if dataLength and dataLength > 0 then
+                            local data = (encoded ~= 0) and raknetBitStreamDecodeString(bs, dataLength + encoded) or raknetBitStreamReadString(bs, dataLength)
+                            if type(data) == 'string' then act = data end
+                        end
+                    end
+                    if off and raknetBitStreamSetReadOffset then raknetBitStreamSetReadOffset(bs, off) end
+                end)
+                if type(act) == 'string' then queueCef(act) end
+            end)
         end)
     end
     
@@ -1178,130 +2201,303 @@ function main()
     ]])
     
     while true do
+        pcall(pumpIncoming)
+        wz.flushState()
+        if wz.needDump then
+            wz.needDump = false
+            wz.lastDump = os.clock()
+            wz.write('DOM', 'dump start')
+            pcall(evalanon, wz.jsDump)
+            wait(250)
+            local dump
+            pcall(function()
+                dump = evalcefReturn('return window.__azDump || "";')
+            end)
+            wz.write('DOM', (dump ~= nil and tostring(dump) ~= '' and tostring(dump)) or 'empty (eval did not return DOM)')
+        end
         wait(0)
-        if status then
-            if (workshop_check and tochi) then
-                wait(1500)
-                stone_check = true
-                triggerEnchantClick()
+        if ws.autoOn() then
+            local target = tonumber(max_toch) or 0
+            local lvl = tonumber(ws.itemEnchant) or -1
+            if target > 0 and lvl >= target then
+                wz.write('LOOP', 'done ench=' .. tostring(lvl))
+                status = false
+                max_toch = 0
                 tochi = false
-                wait(1500)
-                if stone_check then
-                    if #stone > 0 then
-                        table.remove(stone, 1)
-                    end
-                    stone_check = false
-                    tochi = false
-                    wait(500)
-                    click_onStone()
+                sampAddChatMessage(u8:decode("У вас заточился предмет до указанной вами заточки, выбери другой предмет или другой уровень"), -1)
+            elseif not workshop_check then
+                if ws.loopTag ~= 'wait' then
+                    ws.loopTag = 'wait'
+                    wz.write('LOOP', 'wait-workshop ' .. wz.state())
                 end
-            elseif workshop_check and status and max_toch > 0 and not tochi then
-                -- Периодически пытаемся найти и кликнуть камень если верстак открыт
-                wait(1000)
-                if #stone == 0 then
-                    findAndClickStone()
-                    if workshop_check then
-                        tochi = true
-                    end
-                else
-                    click_onStone()
-                end
-            elseif status and max_toch > 0 and not workshop_check then
-                -- Периодически проверяем, не открылся ли верстак через CEF
-                wait(2000)
-                checkWorkshopStatus()
                 wait(500)
-                if workshop_check then
+            elseif ws.busy then
+                if os.clock() - (tonumber(ws.busyAt) or 0) > 20 then
+                    wz.write('LOOP', 'busy-timeout')
+                    ws.busy = false
+                    ws.loopTag = ''
+                else
+                    wait(120)
+                end
+            else
+                local ready = ws.loopReady()
+                if ready then
+                    ws.loopTag = 'go'
+                    wz.write('LOOP', 'go ' .. wz.state())
+                    ws.busy = true
+                    ws.busyAt = os.clock()
+                    triggerEnchantClick()
+                    wait(800)
+                else
+                    if ws.loopTag ~= 'not-ready' then
+                        ws.loopTag = 'not-ready'
+                        wz.write('LOOP', 'not-ready ' .. wz.state())
+                    end
                     click_onStone()
+                    if ws.isGun() then
+                        wait(600)
+                    else
+                        wait(800)
+                    end
                 end
             end
         end
     end
 end
 
+function ws.uiAccent()
+    return imgui.ImVec4(0.36, 0.58, 1.00, 1)
+end
+
+function ws.uiNav(label, selected, w)
+    if selected then
+        imgui.PushStyleColor(imgui.Col.Button, ws.uiAccent())
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.46, 0.66, 1, 1))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.30, 0.50, 0.95, 1))
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.07, 0.08, 0.10, 1))
+    else
+        imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(1, 1, 1, 0.05))
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.36, 0.58, 1, 0.22))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.36, 0.58, 1, 0.35))
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.78, 0.80, 0.86, 1))
+    end
+    local clicked = imgui.Button(label, imgui.ImVec2(w, 32))
+    imgui.PopStyleColor(4)
+    return clicked
+end
+
+function ws.uiIcon(label, w)
+    imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(1, 1, 1, 0.06))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.36, 0.58, 1, 0.35))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.36, 0.58, 1, 0.55))
+    local clicked = imgui.Button(label, imgui.ImVec2(w or 28, 28))
+    imgui.PopStyleColor(3)
+    return clicked
+end
+
+function ws.uiLvl(i, w, h)
+    local on = (i == max_toch)
+    if on then
+        imgui.PushStyleColor(imgui.Col.Button, ws.uiAccent())
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.46, 0.66, 1, 1))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.30, 0.50, 0.95, 1))
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.07, 0.08, 0.10, 1))
+    else
+        imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(1, 1, 1, 0.06))
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.36, 0.58, 1, 0.28))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.36, 0.58, 1, 0.45))
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.82, 0.84, 0.90, 1))
+    end
+    local clicked = imgui.Button('+' .. tostring(i), imgui.ImVec2(w, h))
+    imgui.PopStyleColor(4)
+    return clicked
+end
+
+function ws.pickLevel(i)
+    if max_toch ~= i then
+        status = true
+        max_toch = i
+        ws.lowMatSaid = false
+        wz.write('UI', 'toch +' .. tostring(i) .. ' ' .. wz.state())
+        lua_thread.create(function()
+            wait(120)
+            click_onStone()
+            wait(400)
+            if status and ws.loopReady() and not ws.busy then
+                ws.busy = true
+                ws.busyAt = os.clock()
+                triggerEnchantClick()
+            end
+        end)
+    else
+        status = false
+        max_toch = 0
+        tochi = false
+        stone_check = false
+        wz.write('UI', 'stop +' .. tostring(i))
+    end
+end
+
+function ws.drawSettingsBody()
+    imgui.TextDisabled('Версия ' .. tostring(thisScript().version or '1.0'))
+    imgui.Dummy(imgui.ImVec2(0, 8))
+    if imgui.Checkbox('Звук при успехе', playSound) then
+        addOneOffSound(0.0, 0.0, 0.0, 1139)
+    end
+    imgui.Dummy(imgui.ImVec2(0, 10))
+    if imgui.Button('Очистить статистику', imgui.ImVec2(476, 32)) then
+        ws.clearStats()
+    end
+    imgui.Dummy(imgui.ImVec2(0, 4))
+    if imgui.Button('Перезагрузить скрипт', imgui.ImVec2(476, 32)) then
+        lua_thread.create(function()
+            sampAddChatMessage(u8:decode('[AutoZatochka] Перезагрузка скрипта...'), -1)
+            wait(1000)
+            thisScript():reload()
+        end)
+    end
+    imgui.Dummy(imgui.ImVec2(0, 4))
+    if imgui.Button('Проверить обновления', imgui.ImVec2(476, 32)) then
+        lua_thread.create(function()
+            if autoupdate_loaded and Update then
+                sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Проверка обновлений...'), -1)
+                wait(100)
+                pcall(Update.check, Update.json_url, Update.prefix, Update.url)
+                wait(500)
+                sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Если есть новая версия - скрипт обновится и перезагрузится.'), -1)
+            else
+                sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Автообновление недоступно (нет decodeJson).'), -1)
+            end
+        end)
+    end
+    imgui.Dummy(imgui.ImVec2(0, 14))
+    imgui.TextDisabled('/mt  закрыть окно')
+    imgui.TextDisabled('Шестерёнка ещё раз — назад')
+end
+
 imgui.OnFrame(function() return WinState[0] end,
-    function(player)
-        imgui.SetNextWindowPos(imgui.ImVec2(500,500), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
-        imgui.SetNextWindowSize(imgui.ImVec2(430, 390), imgui.Cond.Always)
+    function()
+        local W, H = 508, 418
+        imgui.SetNextWindowPos(imgui.ImVec2(500, 500), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
+        imgui.SetNextWindowSize(imgui.ImVec2(W, H), imgui.Cond.Always)
         imgui.Begin('##Window', WinState, imgui.WindowFlags.NoDecoration)
-        imgui.SetCursorPosX(70) imgui.Text('Автозаточка | CEF интерфейс by GPT :D')
-        imgui.SameLine() imgui.SetCursorPosX(408) if imgui.Button('##CloseButton', imgui.ImVec2(15, 15)) then WinState[0] = false end imgui.Separator()
-        
-        if imgui.BeginChild('##tochLVL', imgui.ImVec2(85, 350), true) then
-            imgui.Text('Точить до') imgui.Separator() imgui.SetCursorPosY(32)
-            for i = 1, 12 do imgui.SetCursorPosX(20)
-                if imgui.ColoredButton('+'..tostring(i), imgui.ImVec2(30, 20), (i==max_toch and '32CD32' or 'F94242'), 50) then
-                    if max_toch ~= i then
-                        status = true
-                        max_toch = i
-                        -- Вызываем асинхронно, чтобы избежать ошибки "yield across C-call boundary"
-                        lua_thread.create(function()
-                            wait(100)
-                            click_onStone()
-                        end)
-                    else
-                        status = false
-                        max_toch = 0
-                        tochi = false
-                        stone_check = false
-                        workshop_check = false
+        local dl = imgui.GetWindowDrawList()
+        local p = imgui.GetWindowPos()
+        local sz = imgui.GetWindowSize()
+        dl:AddRectFilled(p, imgui.ImVec2(p.x + 4, p.y + sz.y), imgui.ColorConvertFloat4ToU32(ws.uiAccent()), 2)
+        imgui.SetCursorPos(imgui.ImVec2(16, 12))
+        imgui.PushStyleColor(imgui.Col.Text, ws.uiAccent())
+        imgui.Text('AutoZatochka')
+        imgui.PopStyleColor()
+        imgui.SameLine()
+        imgui.TextDisabled('  Arizona  ·  ' .. tostring(thisScript().version or ''))
+        imgui.SetCursorPos(imgui.ImVec2(W - 76, 8))
+        if ws.uiIcon('##gear', 28) then
+            SetWin[0] = not SetWin[0]
+        end
+        do
+            local a = imgui.GetItemRectMin()
+            local b = imgui.GetItemRectMax()
+            local cx = (a.x + b.x) * 0.5
+            local cy = (a.y + b.y) * 0.5
+            local col = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.91, 0.92, 0.94, 1))
+            pcall(function()
+                dl:AddCircleFilled(imgui.ImVec2(cx - 6, cy), 2.1, col, 8)
+                dl:AddCircleFilled(imgui.ImVec2(cx, cy), 2.1, col, 8)
+                dl:AddCircleFilled(imgui.ImVec2(cx + 6, cy), 2.1, col, 8)
+            end)
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(SetWin[0] and 'Назад' or 'Настройки')
+        end
+        imgui.SameLine()
+        imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0.8, 0.22, 0.32, 0.35))
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.9, 0.25, 0.35, 0.7))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.9, 0.25, 0.35, 0.9))
+        if imgui.Button('X', imgui.ImVec2(28, 28)) then
+            WinState[0] = false
+            SetWin[0] = false
+        end
+        imgui.PopStyleColor(3)
+
+        if SetWin[0] then
+            imgui.SetCursorPos(imgui.ImVec2(16, 52))
+            imgui.PushStyleColor(imgui.Col.Text, ws.uiAccent())
+            imgui.Text('Настройки')
+            imgui.PopStyleColor()
+            imgui.Separator()
+            imgui.Dummy(imgui.ImVec2(0, 8))
+            ws.drawSettingsBody()
+        else
+            imgui.SetCursorPos(imgui.ImVec2(16, 48))
+            if ws.uiNav('Заточка аксов/скинов', tonumber(ws.tab) == 0, 234) then
+                ws.setTab(0)
+            end
+            imgui.SameLine()
+            if ws.uiNav('Скины на оружие', tonumber(ws.tab) == 1, 234) then
+                ws.setTab(1)
+            end
+
+            imgui.SetCursorPos(imgui.ImVec2(16, 90))
+            if imgui.BeginChild('##status', imgui.ImVec2(476, 52), false) then
+                local ench = tonumber(ws.itemEnchant) or -1
+                local run = status and (tonumber(max_toch) or 0) > 0
+                if run then
+                    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.45, 0.85, 0.55, 1))
+                    imgui.Text('Точит до +' .. tostring(max_toch))
+                    imgui.PopStyleColor()
+                else
+                    imgui.TextDisabled('Выбери уровень')
+                end
+                if ench >= 0 then
+                    imgui.SameLine()
+                    imgui.TextDisabled('  ·  сейчас +' .. tostring(ench))
+                end
+                if ws.isGun() then
+                    imgui.TextDisabled('Камни  ' .. tostring(ws.stoneAmount or 0) .. ' / ' .. tostring(ws.rightNeed or 2)
+                        .. '      Ресурс  ' .. tostring(ws.resAmount or 0) .. ' / ' .. tostring(ws.leftNeed or 0))
+                else
+                    imgui.TextDisabled('Точильные камни  ' .. tostring(ws.stoneAmount or 0))
+                end
+                imgui.EndChild()
+            end
+
+            imgui.SetCursorPos(imgui.ImVec2(16, 146))
+            imgui.TextDisabled('Точить до')
+            do
+                local i
+                for i = 1, 12 do
+                    local col = (i - 1) % 4
+                    local row = math.floor((i - 1) / 4)
+                    imgui.SetCursorPos(imgui.ImVec2(16 + col * 118, 168 + row * 36))
+                    if ws.uiLvl(i, 110, 30) then
+                        ws.pickLevel(i)
                     end
                 end
             end
-            imgui.EndChild()
-        end imgui.SameLine()
-        
-        if imgui.BeginChild('##stats', imgui.ImVec2(160, 350), true) then
-            imgui.SetCursorPosX(35) imgui.Text('Статистика') imgui.Separator()
-            for k, v in pairs(lost_stone) do
-                imgui.Text('С +' .. (v[2]-1) .. ' до +' .. v[2] .. ': ' .. attemptsWord(v[1]))
+
+            imgui.SetCursorPos(imgui.ImVec2(16, 284))
+            if imgui.BeginChild('##stats', imgui.ImVec2(476, 118), false) then
+                imgui.PushStyleColor(imgui.Col.Text, ws.uiAccent())
+                imgui.Text(ws.isGun() and 'Статистика  ·  скины на оружие' or 'Статистика  ·  аксы/скины')
+                imgui.PopStyleColor()
                 imgui.Separator()
-            end
-            imgui.Text('Всего попыток: ' .. all_lost)
-            imgui.EndChild()
-        end imgui.SameLine()
-        
-        if imgui.BeginChild('##other', imgui.ImVec2(190, 350), true) then
-            imgui.SetCursorPosX(55) imgui.Text('Настройки') imgui.Separator()
-            imgui.Separator()
-            if imgui.Button('Очистить статистику', imgui.ImVec2(140, 24)) then
-                lost_stone = {}
-                all_lost = 0
-                lost_stone_onLVL = 0
-                max_toch = 0
-                status = false
-                tochi = false
-                stone_check = false
-                workshop_check = false
-            end
-            if imgui.Button('Перезагрузить скрипт', imgui.ImVec2(140, 24)) then
-                lua_thread.create(function()
-                    sampAddChatMessage(u8:decode('[AutoZatochka] Перезагрузка скрипта...'), -1)
-                    wait(1000)
-                    thisScript():reload()
-                end)
-            end
-            if imgui.Button('Проверить обновления', imgui.ImVec2(140, 24)) then
-                lua_thread.create(function()
-                    if autoupdate_loaded and Update then
-                        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Проверка обновлений...'), -1)
-                        wait(100)
-                        pcall(Update.check, Update.json_url, Update.prefix, Update.url)
-                        wait(500)
-                        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Если есть новая версия — скрипт обновится и перезагрузится.'), -1)
-                    else
-                        sampAddChatMessage('[AutoZatochka] ' .. u8:decode('Автообновление недоступно (нет decodeJson).'), -1)
+                local rows = ws.isGun() and (ws.gRows or {}) or lost_stone
+                local total = ws.isGun() and (tonumber(ws.gAll) or 0) or all_lost
+                local cur = ws.isGun() and (tonumber(ws.gLvl) or 0) or lost_stone_onLVL
+                local n
+                for n = 1, #rows do
+                    local v = rows[n]
+                    if type(v) == 'table' then
+                        imgui.Text('С +' .. tostring((v[2] or 1) - 1) .. ' до +' .. tostring(v[2]) .. '  —  ' .. attemptsWord(v[1]))
                     end
-                end)
+                end
+                if cur > 0 then
+                    imgui.TextDisabled('Сейчас  ' .. attemptsWord(cur))
+                end
+                imgui.TextDisabled('Всего попыток  ' .. tostring(total))
+                imgui.EndChild()
             end
-            if imgui.Checkbox('Включить звук', playSound) then
-                addOneOffSound(0.0, 0.0, 0.0, 1139)
-            end
-            imgui.Text('Версия: ' .. tostring(thisScript().version or '1.0'))
-            for i = 54, 10, -1 do
-                imgui.ColSeparator('FF0000', i)
-            end
-            imgui.EndChild()
         end
         imgui.End()
     end
@@ -1316,7 +2512,7 @@ end, function()
     imgui.SetNextWindowPos(imgui.ImVec2(w * 0.5, io.DisplaySize.y * 0.5), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
     imgui.SetNextWindowSize(imgui.ImVec2(500, 0), imgui.Cond.FirstUseEver)
     local wf = imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoCollapse
-    if imgui.Begin('ВАЖНО — обновление AutoZatochka', nil, wf) then
+    if imgui.Begin('ВАЖНО - обновление AutoZatochka', nil, wf) then
         imgui.TextColored(imgui.ImVec4(1, 0.35, 0.12, 1), 'Список изменений')
         imgui.Separator()
         imgui.BeginChild('##changelog_scroll', imgui.ImVec2(460, 240), true)
@@ -1382,92 +2578,40 @@ function checkWorkshopStatus()
     if detected == true or detected == 1 or detected == 'true' then
         workshop_check = true
     end
+    wz.write('WS', 'check detected=' .. tostring(detected) .. ' ' .. wz.state())
 end
 
--- == Обработка событий == --
-function sampev.onShowTextDraw(id, data)
-    if data.text and (data.text:find('WORKSHOP') or data.text:find('МАСТЕРСКАЯ') or data.text:find('Мастерская') or data.text:find('ВЕРСТАК') or data.text:find('Верстак') or data.text:find('верстак')) then
-        stone = {}
-        workshop_check = true
-    end
-    
-    if data.text and (data.text:find('ENCHANT') or data.text:find('ЗАТОЧКА') or data.text:find('Заточка')) then
-        button_id = id - 1
-    end
-    
-    if data.letterColor == -10398017 and data.lineWidth == 44 and data.lineHeight == 16 and data.position.x < 200 then
-        button_id = id
-    end
-    
-    if workshop_check then
-        if stone_check then
-            if data.lineWidth >= 1 then
-                stone_check = false
-            end
-        end
-        if data.modelId == Whetstone_ITEM_ID and data.selectable == 1 then
-            table.insert(stone, {id})
+-- == Обработка событий: копии в очередь, прошлые хуки не затираем == --
+if sampev then
+    local prevTd = sampev.onShowTextDraw
+    function sampev.onShowTextDraw(id, data)
+        pcall(function()
+            if type(data) ~= 'table' then return end
+            local text = data.text
+            queueTd({
+                id = tonumber(id) or 0,
+                text = type(text) == 'string' and (text .. '') or '',
+                letterColor = tonumber(data.letterColor),
+                lineWidth = tonumber(data.lineWidth),
+                lineHeight = tonumber(data.lineHeight),
+                modelId = tonumber(data.modelId),
+                selectable = tonumber(data.selectable),
+            })
+        end)
+        if prevTd then
+            local ok, a, b = pcall(prevTd, id, data)
+            if ok then return a, b end
         end
     end
-end
 
--- Паттерны чата: заточка отслеживается ТОЛЬКО по тексту "с +X на +Y"
-local PATTERN_FAIL       = u8:decode("Увы, вам не удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)")
-local PATTERN_FAIL_U8    = "Увы, вам не удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)"
-local PATTERN_SUCCESS    = u8:decode("Успех! Вам удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)")
-local PATTERN_SUCCESS_U8 = "Успех! Вам удалось улучшить предмет .- c %+([0-9]+) на %+([0-9]+)"
-
-local function parseEnchantLevelsFromChat(text)
-    local fromLvl, toLvl = text:match(PATTERN_SUCCESS)
-    if not fromLvl then fromLvl, toLvl = text:match(PATTERN_SUCCESS_U8) end
-    if fromLvl and toLvl then
-        return true, tonumber(fromLvl), tonumber(toLvl)
-    end
-
-    fromLvl, toLvl = text:match(PATTERN_FAIL)
-    if not fromLvl then fromLvl, toLvl = text:match(PATTERN_FAIL_U8) end
-    if fromLvl and toLvl then
-        return false, tonumber(fromLvl), tonumber(toLvl)
-    end
-
-    return nil, nil, nil
-end
-
-function sampev.onServerMessage(color, text)
-    if max_toch > 0 and text and #text > 0 then
-        local t = text:gsub("%{%x%x%x%x%x%x%}", "")  -- убрать коды цветов {FFFFFF} и т.д.
-
-        local isSuccess, fromLvl, toLvl = parseEnchantLevelsFromChat(t)
-        if isSuccess == nil then
-            return
-        end
-
-        if not isSuccess then
-            tochi = true
-            all_lost = all_lost + 1
-            lost_stone_onLVL = lost_stone_onLVL + 1
-            return
-        end
-
-        if isSuccess and toLvl then
-            playSuccessSound()
-            lost_stone_onLVL = lost_stone_onLVL + 1
-            all_lost = all_lost + 1
-            table.insert(lost_stone, {lost_stone_onLVL, toLvl})
-            lost_stone_onLVL = 0
-
-            local target = tonumber(max_toch) or 0
-            -- Останавливаемся только на точном успешном переходе c +(target-1) на +target.
-            -- Например для "точить до +12" — только после текста "c +11 на +12".
-            if toLvl == target and fromLvl == (target - 1) then
-                tochi = false
-                max_toch = 0
-                stone_check = false
-                status = false
-                sampAddChatMessage(u8:decode("У вас заточился предмет до указанной вами заточки, выбери другой предмет или другой уровень"), -1)
-            else
-                tochi = true
-            end
+    local prevMsg = sampev.onServerMessage
+    function sampev.onServerMessage(color, text)
+        pcall(function()
+            if type(text) == 'string' and text ~= '' then queueChat(text) end
+        end)
+        if prevMsg then
+            local ok, a = pcall(prevMsg, color, text)
+            if ok then return a end
         end
     end
 end
@@ -1506,70 +2650,68 @@ end)
 function theme()
     imgui.SwitchContext()
     local ImVec4 = imgui.ImVec4
-    -- Матовый чёрный
-    imgui.GetStyle().WindowPadding = imgui.ImVec2(8, 8)
-    imgui.GetStyle().FramePadding = imgui.ImVec2(6, 4)
-    imgui.GetStyle().ItemSpacing = imgui.ImVec2(6, 6)
+    imgui.GetStyle().WindowPadding = imgui.ImVec2(10, 10)
+    imgui.GetStyle().FramePadding = imgui.ImVec2(10, 6)
+    imgui.GetStyle().ItemSpacing = imgui.ImVec2(8, 8)
     imgui.GetStyle().ItemInnerSpacing = imgui.ImVec2(4, 2)
     imgui.GetStyle().TouchExtraPadding = imgui.ImVec2(0, 0)
     imgui.GetStyle().IndentSpacing = 12
-    imgui.GetStyle().ScrollbarSize = 10
+    imgui.GetStyle().ScrollbarSize = 8
     imgui.GetStyle().GrabMinSize = 10
-    imgui.GetStyle().WindowBorderSize = 1
-    imgui.GetStyle().ChildBorderSize = 1
-    imgui.GetStyle().PopupBorderSize = 1
-    imgui.GetStyle().FrameBorderSize = 1
-    imgui.GetStyle().TabBorderSize = 1
-    imgui.GetStyle().WindowRounding = 8
-    imgui.GetStyle().ChildRounding = 6
+    imgui.GetStyle().WindowBorderSize = 0
+    imgui.GetStyle().ChildBorderSize = 0
+    imgui.GetStyle().PopupBorderSize = 0
+    imgui.GetStyle().FrameBorderSize = 0
+    imgui.GetStyle().TabBorderSize = 0
+    imgui.GetStyle().WindowRounding = 10
+    imgui.GetStyle().ChildRounding = 8
     imgui.GetStyle().FrameRounding = 6
     imgui.GetStyle().PopupRounding = 8
-    imgui.GetStyle().ScrollbarRounding = 4
+    imgui.GetStyle().ScrollbarRounding = 8
     imgui.GetStyle().GrabRounding = 4
     imgui.GetStyle().TabRounding = 6
 
-    -- Матовый чёрный: тёмные фоны без блеска, светлый текст
-    imgui.GetStyle().Colors[imgui.Col.Text]                   = ImVec4(0.92, 0.92, 0.94, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.TextDisabled]           = ImVec4(0.45, 0.45, 0.48, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.WindowBg]               = ImVec4(0.09, 0.09, 0.10, 0.98)
-    imgui.GetStyle().Colors[imgui.Col.ChildBg]                = ImVec4(0.11, 0.11, 0.12, 0.98)
-    imgui.GetStyle().Colors[imgui.Col.PopupBg]                = ImVec4(0.10, 0.10, 0.11, 0.98)
-    imgui.GetStyle().Colors[imgui.Col.Border]                 = ImVec4(0.22, 0.22, 0.24, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.Text]                   = ImVec4(0.91, 0.92, 0.94, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.TextDisabled]           = ImVec4(0.55, 0.57, 0.63, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.WindowBg]               = ImVec4(0.055, 0.06, 0.08, 0.96)
+    imgui.GetStyle().Colors[imgui.Col.ChildBg]                = ImVec4(0.07, 0.08, 0.11, 0.55)
+    imgui.GetStyle().Colors[imgui.Col.PopupBg]                = ImVec4(0.09, 0.10, 0.13, 0.98)
+    imgui.GetStyle().Colors[imgui.Col.Border]                 = ImVec4(1.00, 1.00, 1.00, 0.06)
     imgui.GetStyle().Colors[imgui.Col.BorderShadow]           = ImVec4(0.00, 0.00, 0.00, 0.00)
-    imgui.GetStyle().Colors[imgui.Col.FrameBg]                = ImVec4(0.14, 0.14, 0.16, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.FrameBgHovered]         = ImVec4(0.18, 0.18, 0.20, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.FrameBgActive]          = ImVec4(0.20, 0.20, 0.22, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.TitleBg]                = ImVec4(0.08, 0.08, 0.09, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.TitleBgActive]          = ImVec4(0.10, 0.10, 0.11, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.TitleBgCollapsed]       = ImVec4(0.08, 0.08, 0.09, 0.75)
-    imgui.GetStyle().Colors[imgui.Col.MenuBarBg]             = ImVec4(0.11, 0.11, 0.12, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.ScrollbarBg]            = ImVec4(0.08, 0.08, 0.09, 0.90)
-    imgui.GetStyle().Colors[imgui.Col.ScrollbarGrab]          = ImVec4(0.28, 0.28, 0.30, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.ScrollbarGrabHovered]   = ImVec4(0.35, 0.35, 0.38, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.ScrollbarGrabActive]    = ImVec4(0.42, 0.42, 0.45, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.CheckMark]              = ImVec4(0.75, 0.75, 0.78, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.SliderGrab]             = ImVec4(0.32, 0.32, 0.35, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.SliderGrabActive]       = ImVec4(0.40, 0.40, 0.44, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.Button]                 = ImVec4(0.18, 0.18, 0.20, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.ButtonHovered]          = ImVec4(0.24, 0.24, 0.26, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.ButtonActive]           = ImVec4(0.28, 0.28, 0.30, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.Header]                 = ImVec4(0.16, 0.16, 0.18, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.HeaderHovered]          = ImVec4(0.22, 0.22, 0.24, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.HeaderActive]           = ImVec4(0.26, 0.26, 0.28, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.Separator]              = ImVec4(0.24, 0.24, 0.26, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.SeparatorHovered]       = ImVec4(0.38, 0.38, 0.40, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.SeparatorActive]        = ImVec4(0.48, 0.48, 0.50, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.ResizeGrip]             = ImVec4(0.20, 0.20, 0.22, 0.80)
-    imgui.GetStyle().Colors[imgui.Col.ResizeGripHovered]      = ImVec4(0.28, 0.28, 0.30, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.ResizeGripActive]       = ImVec4(0.34, 0.34, 0.36, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.FrameBg]                = ImVec4(1.00, 1.00, 1.00, 0.05)
+    imgui.GetStyle().Colors[imgui.Col.FrameBgHovered]         = ImVec4(0.36, 0.58, 1.00, 0.22)
+    imgui.GetStyle().Colors[imgui.Col.FrameBgActive]          = ImVec4(0.36, 0.58, 1.00, 0.35)
+    imgui.GetStyle().Colors[imgui.Col.TitleBg]                = ImVec4(0.07, 0.08, 0.10, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.TitleBgActive]          = ImVec4(0.07, 0.08, 0.10, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.TitleBgCollapsed]       = ImVec4(0.07, 0.08, 0.10, 0.75)
+    imgui.GetStyle().Colors[imgui.Col.MenuBarBg]             = ImVec4(0.07, 0.08, 0.11, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.ScrollbarBg]            = ImVec4(0.00, 0.00, 0.00, 0.00)
+    imgui.GetStyle().Colors[imgui.Col.ScrollbarGrab]          = ImVec4(1.00, 1.00, 1.00, 0.12)
+    imgui.GetStyle().Colors[imgui.Col.ScrollbarGrabHovered]   = ImVec4(0.36, 0.58, 1.00, 0.45)
+    imgui.GetStyle().Colors[imgui.Col.ScrollbarGrabActive]    = ImVec4(0.36, 0.58, 1.00, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.CheckMark]              = ImVec4(0.36, 0.58, 1.00, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.SliderGrab]             = ImVec4(0.36, 0.58, 1.00, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.SliderGrabActive]       = ImVec4(1.00, 1.00, 1.00, 0.90)
+    imgui.GetStyle().Colors[imgui.Col.Button]                 = ImVec4(0.36, 0.58, 1.00, 0.28)
+    imgui.GetStyle().Colors[imgui.Col.ButtonHovered]          = ImVec4(0.36, 0.58, 1.00, 0.55)
+    imgui.GetStyle().Colors[imgui.Col.ButtonActive]           = ImVec4(0.36, 0.58, 1.00, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.Header]                 = ImVec4(0.36, 0.58, 1.00, 0.25)
+    imgui.GetStyle().Colors[imgui.Col.HeaderHovered]          = ImVec4(0.36, 0.58, 1.00, 0.40)
+    imgui.GetStyle().Colors[imgui.Col.HeaderActive]           = ImVec4(0.36, 0.58, 1.00, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.Separator]              = ImVec4(1.00, 1.00, 1.00, 0.07)
+    imgui.GetStyle().Colors[imgui.Col.SeparatorHovered]       = ImVec4(0.36, 0.58, 1.00, 0.45)
+    imgui.GetStyle().Colors[imgui.Col.SeparatorActive]        = ImVec4(0.36, 0.58, 1.00, 0.70)
+    imgui.GetStyle().Colors[imgui.Col.ResizeGrip]             = ImVec4(0.36, 0.58, 1.00, 0.25)
+    imgui.GetStyle().Colors[imgui.Col.ResizeGripHovered]      = ImVec4(0.36, 0.58, 1.00, 0.55)
+    imgui.GetStyle().Colors[imgui.Col.ResizeGripActive]       = ImVec4(0.36, 0.58, 1.00, 0.80)
     imgui.GetStyle().Colors[imgui.Col.Tab]                    = ImVec4(0.16, 0.16, 0.18, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.TabHovered]             = ImVec4(0.24, 0.24, 0.26, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.TabActive]              = ImVec4(0.20, 0.20, 0.22, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.TabHovered]             = ImVec4(0.36, 0.58, 1.00, 0.40)
+    imgui.GetStyle().Colors[imgui.Col.TabActive]              = ImVec4(0.36, 0.58, 1.00, 0.55)
     imgui.GetStyle().Colors[imgui.Col.TabUnfocused]          = ImVec4(0.12, 0.12, 0.14, 1.00)
     imgui.GetStyle().Colors[imgui.Col.TabUnfocusedActive]     = ImVec4(0.18, 0.18, 0.20, 1.00)
     imgui.GetStyle().Colors[imgui.Col.PlotLines]              = ImVec4(0.50, 0.50, 0.54, 1.00)
     imgui.GetStyle().Colors[imgui.Col.PlotLinesHovered]       = ImVec4(0.65, 0.65, 0.70, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.PlotHistogram]          = ImVec4(0.38, 0.38, 0.42, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.PlotHistogramHovered]   = ImVec4(0.48, 0.48, 0.52, 1.00)
-    imgui.GetStyle().Colors[imgui.Col.TextSelectedBg]         = ImVec4(0.28, 0.28, 0.32, 0.85)
+    imgui.GetStyle().Colors[imgui.Col.PlotHistogram]          = ImVec4(0.36, 0.58, 1.00, 0.70)
+    imgui.GetStyle().Colors[imgui.Col.PlotHistogramHovered]   = ImVec4(0.36, 0.58, 1.00, 1.00)
+    imgui.GetStyle().Colors[imgui.Col.TextSelectedBg]         = ImVec4(0.36, 0.58, 1.00, 0.35)
 end
